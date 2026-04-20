@@ -2,8 +2,8 @@
   <img src="resources/icon.png" alt="revvy Logo" width="100" />
   <br />
   <br />
-  <a href="https://marketplace.visualstudio.com/items?itemName=YonK0.revvy">
-    <img src="https://img.shields.io/visual-studio-marketplace/v/YonK0.revvy?label=VS%20Code%20Marketplace" alt="VS Code Marketplace" />
+  <a href="https://marketplace.visualstudio.com/items?itemName=YonK0.revvy-reviewer">
+    <img src="https://img.shields.io/visual-studio-marketplace/v/YonK0.revvy-reviewer?label=VS%20Code%20Marketplace" alt="VS Code Marketplace" />
   </a>
   <a href="./LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" />

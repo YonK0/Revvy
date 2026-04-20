@@ -1,8 +1,8 @@
 {
-  "name": "revvy",
-  "displayName": "Revvy",
+  "name": "revvy-reviewer",
+  "displayName": "Revvy AI Reviewer",
   "description": "AI-powered code review extension with YAML-configurable rule profiles. Supports GitHub Copilot, OpenAI, and Anthropic. Built for teams and enterprises.",
-  "version": "1.0.3",
+  "version": "1.0.1",
   "publisher": "YonK0",
   "license": "MIT",
   "repository": {
