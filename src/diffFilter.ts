@@ -270,3 +270,42 @@ export function normalizeGitLabDiffResponse(text: string): string {
 
   return sections.length > 0 ? sections.join('\n') : text;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Remote diff normalizer (MCP format → unified diff)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Normalize diffs from various MCP servers into standard unified-diff format.
+ * - GitHub MCP: returns unified diffs with `diff --git` headers — passes through.
+ * - GitHub get_pull_request_files variant: returns patch strings per-file,
+ *   missing the `diff --git` header. Prepends it.
+ * - GitLab MCP: may return JSON objects or `diff --git`-less patches; normalize.
+ */
+export function normalizeRemoteDiff(raw: string): string {
+  // Already in unified format with headers — pass through.
+  if (raw.includes('diff --git ')) { return raw; }
+
+  // If it's a bare patch (starts with "--- a/" or "@@" or "+++"), synthesize a header.
+  if (/^(---|\+\+\+|@@)/m.test(raw)) {
+    // Best-effort: extract file paths from "+++ b/..." line
+    const pathMatch = raw.match(/^\+\+\+ b\/(.+)$/m);
+    if (pathMatch) {
+      const filePath = pathMatch[1].trim();
+      return `diff --git a/${filePath} b/${filePath}\n${raw}`;
+    }
+    // Try to extract from "@@ -X,Y +Z,W @@" pattern as fallback
+    const hunkMatch = raw.match(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@\s*(?:^---|\+\+\+)/m);
+    if (hunkMatch) {
+      const fileLine = raw.split('\n').find(l => l.startsWith('+++ b/'));
+      if (fileLine) {
+        const fp = fileLine.slice(4).trim();
+        return `diff --git a/${fp} b/${fp}\n${raw}`;
+      }
+    }
+  }
+
+  // Unknown format — return as-is; splitter will fall back to treating
+  // the whole thing as one file section.
+  return raw;
+}

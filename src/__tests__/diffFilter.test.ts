@@ -3,7 +3,7 @@
 // No VS Code host or mocks needed — this module is pure functions.
 
 import { describe, it, expect } from 'vitest';
-import { filterDiff, splitDiffByFile, isNewFile, normalizeGitLabDiffResponse } from '../diffFilter';
+import { filterDiff, splitDiffByFile, isNewFile, normalizeGitLabDiffResponse, normalizeRemoteDiff } from '../diffFilter';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -525,5 +525,58 @@ describe('normalizeGitLabDiffResponse', () => {
     expect(sections).toHaveLength(1);
     expect(sections[0].isNewFile).toBe(true);
     expect(sections[0].filePath).toBe('src/brand_new.ts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — normalizeRemoteDiff
+// ---------------------------------------------------------------------------
+
+describe('normalizeRemoteDiff', () => {
+  it('returns unified diff with headers unchanged', () => {
+    const unified = `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1 +1 @@
+-const x = 1;
++const x = 2;`;
+    expect(normalizeRemoteDiff(unified)).toBe(unified);
+  });
+
+  it('adds diff header to bare patch with +++ path', () => {
+    const patch = `+++ b/src/bar.ts
+@@ -1 +1 @@
+-const a = 1;
++const a = 2;`;
+    const result = normalizeRemoteDiff(patch);
+    expect(result).toContain('diff --git a/src/bar.ts b/src/bar.ts');
+    expect(result).toContain(patch);
+  });
+
+  it('returns bare hunk unchanged (cannot synthesize header without filename)', () => {
+    // Without a +++ line, we cannot extract the filename to synthesize a header
+    const patch = `@@ -5,3 +5,4 @@
+ const x = 10;
++const y = 11;
+ const z = 12;`;
+    const result = normalizeRemoteDiff(patch);
+    // Should return unchanged since we can't determine the file path
+    expect(result).toBe(patch);
+  });
+
+  it('returns text unchanged if format not recognized', () => {
+    const unknown = 'some random text without diff markers';
+    expect(normalizeRemoteDiff(unknown)).toBe(unknown);
+  });
+
+  it('integration: normalized output feeds into splitDiffByFile', () => {
+    const patch = `+++ b/src/integrate.ts
+@@ -1 +1 @@
+-old
++new`;
+    const normalized = normalizeRemoteDiff(patch);
+    const sections = splitDiffByFile(normalized);
+    expect(sections).toHaveLength(1);
+    expect(sections[0].filePath).toBe('src/integrate.ts');
   });
 });

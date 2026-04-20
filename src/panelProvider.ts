@@ -1085,9 +1085,10 @@ body {
       // For remote reviews, render from the diff context stored on the comment.
       let codeSnippet: string;
       if (isRemote) {
+        // Part 3 fix: show file + line info in fallback instead of generic message
         codeSnippet = c.codeContext
           ? this.renderDiffContext(c.codeContext, c.codeContextStartLine ?? c.line, c.line, c.endLine)
-          : `<div class="card-code-unavailable">Code not available for remote review.</div>`;
+          : `<div class="card-code-unavailable">Diff unavailable for ${escapedFile} line ${c.line}.</div>`;
       } else {
         const fileLines = fileLinesCache.get(c.file);
         codeSnippet = this.renderCodeLine(fileLines, c.line, c.endLine);

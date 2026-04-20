@@ -392,3 +392,87 @@ describe('runReview — remote MR codeContext attachment', () => {
     expect(comment.codeContext!.trim().length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests — Bug 2 Part 1: per-comment diff matching
+// ---------------------------------------------------------------------------
+
+describe('Bug 2 Part 1: per-comment diff matching', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('single-file non-parallel path: uses correct file for comment matching', async () => {
+    // Single file diff triggers useParallel=false path
+    const singleFileDiff = `diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -1 +1 @@
+-const old = 1;
++const newAuth = 1;`;
+
+    const remoteSource = { ref: 'MR #1', repo: 'test/repo', mrNumber: 1, type: 'gitlab' as const };
+
+    (callAI as ReturnType<typeof vi.fn>).mockResolvedValue({
+      text: JSON.stringify({
+        verdict: 'REQUEST_CHANGES',
+        score: 3,
+        summary: 'Found issue',
+        comments: [
+          { file: 'src/auth.ts', line: 1, severity: 'error', ruleId: 'SEC01', message: 'null check needed' },
+        ],
+        conclusion: 'Fix.',
+        tests: [],
+      }),
+      model: 'test',
+      backend: 'test',
+    });
+
+    const result = await runReview(singleFileDiff, baseProfile, remoteSource);
+
+    // Comment should exist
+    expect(result.comments).toHaveLength(1);
+    const comment = result.comments[0];
+
+    // Comment should have its file path set correctly (not undefined)
+    expect(comment.file).toBe('src/auth.ts');
+  });
+
+  it('multi-file path: processes each file with its own diff', async () => {
+    // Two files - triggers parallel path
+    const twoFileDiff = `diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -1 +1 @@
+-const old = 1;
++const newAuth = 1;
+
+diff --git a/src/db.ts b/src/db.ts
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -10 +10 @@
+-const db = null;
++const db = connect();`;
+
+    const remoteSource = { ref: 'MR #1', repo: 'test/repo', mrNumber: 1, type: 'gitlab' as const };
+
+    (callAI as ReturnType<typeof vi.fn>).mockResolvedValue({
+      text: JSON.stringify({
+        verdict: 'APPROVE',
+        score: 10,
+        summary: 'OK',
+        comments: [],
+        conclusion: 'OK',
+        tests: [],
+      }),
+      model: 'test',
+      backend: 'test',
+    });
+
+    // For parallel review (2 files), there's no per-file AI response 
+    // - the mock returns empty comments. This test just verifies 
+    // the parallel path executes without error.
+    const result = await runReview(twoFileDiff, baseProfile, remoteSource);
+    expect(result.comments).toHaveLength(0);
+  });
+});

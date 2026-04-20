@@ -11,7 +11,7 @@ import { RuleLoader, ReviewProfile } from './ruleLoader';
 import { runReview, autoDetectProfile, ReviewSource } from './reviewer';
 import { AIKeys } from './aiBackend';
 import { ReviewPanelProvider } from './panelProvider';
-import { normalizeGitLabDiffResponse } from './diffFilter';
+import { normalizeGitLabDiffResponse, normalizeRemoteDiff } from './diffFilter';
 
 const execAsync = promisify(exec);
 
@@ -867,7 +867,8 @@ async function reviewMultiMR() {
             `${'═'.repeat(60)}\n` +
             `REPO: ${ref.owner}/${ref.repo}  |  ${ref.type === 'gitlab' ? 'MR' : 'PR'} #${ref.number}\n` +
             `${'═'.repeat(60)}\n`;
-          diffs.push(header + diff);
+          const normalizedDiff = normalizeRemoteDiff(diff);
+          diffs.push(header + normalizedDiff);
           sources.push({
             ref: ref.display,
             repo: `${ref.owner}/${ref.repo}`,

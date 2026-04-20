@@ -190,6 +190,35 @@ function attachDiffContext(comments: ReviewComment[], fileDiff: string): void {
   }
 }
 
+/**
+ * Mutates each comment in `comments` to attach diff-sourced code context,
+ * matching each comment to its file's diff section via filePath lookup.
+ * This fixes the issue where comments reference files that aren't the first
+ * section but get matched to fileSections[0] instead.
+ */
+function attachDiffContextByFile(
+  comments: ReviewComment[],
+  fileSections: Array<{ filePath: string; diff: string }>,
+  fallbackDiff: string
+): void {
+  // Build filePath -> diff map for O(1) lookup
+  const diffByFile = new Map<string, string>();
+  for (const fs of fileSections) {
+    diffByFile.set(fs.filePath, fs.diff);
+  }
+
+  for (const c of comments) {
+    if (c.line <= 0) { continue; }
+    // Use this comment's file to look up the right diff
+    const fileDiff = diffByFile.get(c.file) ?? fallbackDiff;
+    const ctx = extractDiffContext(fileDiff, c.line, c.endLine);
+    if (ctx) {
+      c.codeContext         = ctx.code;
+      c.codeContextStartLine = ctx.startLineNum;
+    }
+  }
+}
+
 /** Per-file review result with source metadata. */
 export interface FileReviewResult extends ReviewResult {
   filePath: string;
@@ -898,9 +927,10 @@ export async function runReview(
     const durationMs = Date.now() - start;
 
     merged = parseReviewResponse(aiResp.text, profile, aiResp, durationMs, sources);
-    // For remote reviews with a single file, attach diff-sourced code context.
+    // For remote reviews, attach diff-sourced code context.
+    // Use per-file diff matching so each comment gets its own file's diff.
     if (isRemote) {
-      attachDiffContext(merged.comments, fileSections[0]?.diff ?? filteredDiff);
+      attachDiffContextByFile(merged.comments, fileSections, filteredDiff);
     }
     merged.filterStats = {
       keptFiles:           filterResult.keptFiles,
