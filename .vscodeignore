@@ -29,12 +29,14 @@ CODE_OF_CONDUCT.md
 vitest.config.ts
 
 # Misc dev artifacts
+.gitignore
 .editorconfig
 .eslintrc*
 .prettierrc*
 **/.DS_Store
 *.log
 logs/
+out/**/*.map
 
 # AI / tool configs (internal)
 .claude/
@@ -47,3 +49,4 @@ package-lock.json
 
 # Old build artifacts
 *.vsix
+
