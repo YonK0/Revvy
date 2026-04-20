@@ -845,6 +845,16 @@ export async function runReview(
     const allComments = perFileResults.flatMap(r => r.comments);
     const allTests    = perFileResults.flatMap(r => r.tests);
 
+    // Dedupe: same file + line + ruleId = same issue. Fall back to message
+    // when ruleId is missing (older profile responses may omit it).
+    const seenCommentKeys = new Set<string>();
+    const uniqueComments = allComments.filter(c => {
+      const key = `${c.file}|${c.line}|${c.ruleId ?? c.message.slice(0, 80)}`;
+      if (seenCommentKeys.has(key)) { return false; }
+      seenCommentKeys.add(key);
+      return true;
+    });
+
     const seenTestTitles = new Set<string>();
     const uniqueTests = allTests.filter(t => {
       if (seenTestTitles.has(t.title)) { return false; }
@@ -862,7 +872,7 @@ export async function runReview(
       verdict:     mergeVerdicts(perFileResults.map(r => r.verdict)),
       score:       averageScore(perFileResults.map(r => r.score)),
       summary:     perFileResults.map(r => r.summary).filter(Boolean).join(' '),
-      comments:    allComments,
+      comments:    uniqueComments,
       conclusion:  perFileResults.map(r => r.conclusion).filter(Boolean).join(' '),
       tests:       sortTestsByCategory(uniqueTests),
       sources,
