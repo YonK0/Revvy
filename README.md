@@ -37,8 +37,8 @@ Not quite. Revvy also:
 - Reviews multiple GitHub PRs and GitLab MRs in a single pass using MCP
 - Validates your code against Jira ticket requirements — so nothing slips out of scope
 - Generates integration tests (functional + regression)
-- Provides a **Copy as Markdown** button to copy all review comments as a ready-to-use prompt for fixing issues
-- *(Coming soon)* A **Fix** button for one-click remediation
+- Provides a **Copy as Markdown** button that copies all review comments along with a ready-to-use prompt — paste it into your favorite AI assistant (ChatGPT, Claude, Copilot, etc.) to fix every issue in one shot
+- *(Coming soon)* **Auto-comment on PRs/MRs** — Revvy posts a comment on the pull/merge request stating it has been reviewed by the tool, with a summary of findings for reviewers and maintainers to see at a glance
 
 > **It works with the AI backend you already have** — GitHub Copilot (no extra key needed), OpenAI GPT-4o, or Anthropic Claude — with automatic fallback.
 
