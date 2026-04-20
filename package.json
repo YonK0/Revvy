@@ -2,7 +2,7 @@
   "name": "revvy",
   "displayName": "Revvy",
   "description": "AI-powered code review extension with YAML-configurable rule profiles. Supports GitHub Copilot, OpenAI, and Anthropic. Built for teams and enterprises.",
-  "version": "1.0.32",
+  "version": "1.0.2",
   "publisher": "YonK0",
   "license": "MIT",
   "repository": {
@@ -193,9 +193,10 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run bundle",
+    "vscode:prepublish": "npm run bundle:prod",
     "bundle": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "compile": "tsc -p ./",
+    "bundle:prod": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --minify",
     "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "package": "vsce package",
     "typecheck": "tsc --noEmit",

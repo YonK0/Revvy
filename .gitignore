@@ -26,7 +26,11 @@ Thumbs.db
 .env.local
 
 # AI / tool configuration (internal use only)
-.claude/
+.qwen/
+.kombai/
+.cursor/
+.aider*
+.continue/
 
 # Editor directories
 .idea/

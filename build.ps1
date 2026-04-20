@@ -38,7 +38,7 @@ npm install
 
 # -- Bundle extension ---------------------------------------------------------
 Log "Bundling extension with esbuild..."
-npm run bundle
+#npm run bundle
 
 # -- Package VSIX -------------------------------------------------------------
 Log "Packaging VSIX..."
