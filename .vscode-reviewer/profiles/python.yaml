@@ -1,0 +1,45 @@
+# Python Review Profile
+profile:
+  id: python
+  label: "Python"
+  description: "General Python best practices"
+  icon: "$(snake)"
+  file_patterns:
+    - "**/*.py"
+
+  system_prompt_extra: |
+    You are reviewing Python code.
+    Focus on type hints, exception handling, and security.
+
+  metadata:
+    version: "1.0.0"
+    last_modified: "2026-03-08"
+
+  rules:
+    - id: type-hints
+      category: typing
+      severity: warning
+      enabled: true
+      title: "Type hints required"
+      description: "All public functions must have type annotations"
+
+    - id: no-bare-except
+      category: exceptions
+      severity: error
+      enabled: true
+      title: "No bare except"
+      description: "Always specify exception type"
+
+    - id: no-shell-true
+      category: security
+      severity: error
+      enabled: true
+      title: "No shell=True"
+      description: "subprocess must not use shell=True with user input"
+
+    - id: context-manager
+      category: resources
+      severity: warning
+      enabled: true
+      title: "Use context managers"
+      description: "File handles must use with statement"

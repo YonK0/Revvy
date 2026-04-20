@@ -1,0 +1,215 @@
+{
+  "name": "revvy",
+  "displayName": "Revvy",
+  "description": "AI-powered code review extension with YAML-configurable rule profiles. Supports GitHub Copilot, OpenAI, and Anthropic. Built for teams and enterprises.",
+  "version": "1.0.32",
+  "publisher": "YonK0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YonK0/revvy"
+  },
+  "homepage": "https://github.com/YonK0/revvy#readme",
+  "bugs": {
+    "url": "https://github.com/YonK0/revvy/issues"
+  },
+  "keywords": [
+    "code review",
+    "ai",
+    "copilot",
+    "linter",
+    "static analysis",
+    "yaml",
+    "embedded",
+    "devops",
+    "openai",
+    "anthropic"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:revvy.mainPanel",
+    "onCommand:revvy.reviewDiff",
+    "onCommand:revvy.reviewFile",
+    "onCommand:revvy.openRulesFolder",
+    "onCommand:revvy.selectProfile",
+    "onCommand:revvy.reloadRules",
+    "onCommand:revvy.checkProfiles",
+    "onCommand:revvy.setTicketRequirements",
+    "onCommand:revvy.clearTicketRequirements",
+    "onCommand:revvy.reviewMultiMR",
+    "onCommand:revvy.setOpenAIKey",
+    "onCommand:revvy.setAnthropicKey",
+    "onCommand:revvy.goHome"
+  ],
+  "main": "./out/extension.js",
+  "icon": "resources/icon.png",
+  "contributes": {
+    "commands": [
+      {
+        "command": "revvy.reviewDiff",
+        "title": "Review Current Diff",
+        "icon": "$(search)"
+      },
+      {
+        "command": "revvy.reviewFile",
+        "title": "Review Active File",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "revvy.openRulesFolder",
+        "title": "Open Rules Folder",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "revvy.selectProfile",
+        "title": "Switch Review Profile",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "revvy.reloadRules",
+        "title": "Reload Rules from YAML",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "revvy.checkProfiles",
+        "title": "Check Profile Files for Errors",
+        "icon": "$(check)"
+      },
+      {
+        "command": "revvy.setTicketRequirements",
+        "title": "Set Requirements (Optional)",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "revvy.clearTicketRequirements",
+        "title": "Clear Requirements",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "revvy.reviewMultiMR",
+        "title": "Review Multiple MRs / PRs (Multi-Repo)",
+        "icon": "$(repo-forked)"
+      },
+      {
+        "command": "revvy.setOpenAIKey",
+        "title": "Revvy: Set OpenAI API Key"
+      },
+      {
+        "command": "revvy.setAnthropicKey",
+        "title": "Revvy: Set Anthropic API Key"
+      },
+      {
+        "command": "revvy.goHome",
+        "title": "Revvy: Go Home"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "revvy",
+          "title": "Revvy",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "revvy": [
+        {
+          "type": "webview",
+          "id": "revvy.mainPanel",
+          "name": "Review Panel"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Revvy",
+      "properties": {
+        "revvy.rulesPath": {
+          "type": "string",
+          "default": ".vscode-reviewer/profiles",
+          "description": "Path to YAML rules folder (relative to workspace)"
+        },
+        "revvy.aiBackend": {
+          "type": "string",
+          "enum": [
+            "copilot",
+            "openai",
+            "anthropic"
+          ],
+          "default": "copilot",
+          "description": "AI backend to use for code review"
+        },
+        "revvy.activeProfile": {
+          "type": "string",
+          "default": "c-embedded",
+          "description": "Active profile ID"
+        },
+        "revvy.selectedModelId": {
+          "type": "string",
+          "default": "",
+          "description": "Selected Copilot model ID (auto-populated from available models)"
+        },
+        "revvy.jiraBaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Jira base URL (e.g. https://yourcompany.atlassian.net) — used by the Atlassian MCP server"
+        },
+        "revvy.jiraEmail": {
+          "type": "string",
+          "default": "",
+          "description": "Jira account email — used by the Atlassian MCP server"
+        },
+        "revvy.gitlabUrl": {
+          "type": "string",
+          "default": "https://gitlab.com",
+          "description": "GitLab base URL — used by the GitLab MCP server for multi-repo review"
+        }
+      }
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "revvy.reviewFile",
+          "group": "revvy"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "revvy.reviewDiff",
+          "group": "revvy"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run bundle",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "compile": "tsc -p ./",
+    "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "package": "vsce package",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.96.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "esbuild": "^0.28.0",
+    "js-yaml": "^4.1.0",
+    "typescript": "^5.3.0",
+    "vitest": "^2.1.9"
+  }
+}

@@ -1,0 +1,49 @@
+# Source files (compiled/bundled to out/ — not needed in the package)
+src/
+tsconfig.json
+
+# Source maps (not needed in the package)
+out/**/*.map
+
+# Development configs
+.vscode/**
+!.vscode/extensions.json
+
+# CI/CD and GitHub
+.github/
+
+# Build scripts (not needed at runtime)
+build.sh
+build.ps1
+
+# Docs (not needed in the VSIX)
+CONTRIBUTING.md
+CHANGELOG.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+
+# Tests
+**/*.test.ts
+**/*.spec.ts
+.vscode-test/
+vitest.config.ts
+
+# Misc dev artifacts
+.editorconfig
+.eslintrc*
+.prettierrc*
+**/.DS_Store
+*.log
+logs/
+
+# AI / tool configs (internal)
+.claude/
+.kombai/
+.qwen/
+
+# Node
+node_modules/
+package-lock.json
+
+# Old build artifacts
+*.vsix

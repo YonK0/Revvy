@@ -1,0 +1,41 @@
+name: Publish to VS Code Marketplace
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    name: Publish Extension
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Bundle
+        run: npm run bundle
+
+      - name: Verify bundle exists
+        run: |
+          test -f out/extension.js || (echo "Bundle output missing" && exit 1)
+          echo "Bundle present."
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Publish to Marketplace
+        run: vsce publish --pat "${{ secrets.VSCE_PAT }}"

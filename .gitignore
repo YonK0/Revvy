@@ -1,0 +1,36 @@
+# Compiled output
+out/
+
+# Dependencies
+node_modules/
+
+# Extension packages (built artifacts — never commit)
+*.vsix
+
+# VS Code extension test runner
+.vscode-test/
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+*.js.map
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.local
+
+# AI / tool configuration (internal use only)
+.claude/
+
+# Editor directories
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln

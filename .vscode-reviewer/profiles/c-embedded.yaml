@@ -1,0 +1,320 @@
+# C/C++ Embedded Systems Review Profile
+profile:
+  id: c-embedded
+  label: "C/C++ Embedded Systems"
+  description: "STM32, FreeRTOS, bare-metal firmware — safety, security, and reliability"
+  icon: "$(circuit-board)"
+  file_patterns:
+    - "**/*.c"
+    - "**/*.cpp"
+    - "**/*.h"
+    - "**/*.hpp"
+
+  # PHASE 1 — system_prompt_extra is now framing-only.
+  # Rule details live exclusively in the structured rules list below.
+  # Removing the prose restatement of every rule saves ~1200 tokens per call.
+  system_prompt_extra: |
+    You are reviewing embedded C/C++ firmware for microcontrollers (STM32, FreeRTOS, bare-metal).
+
+    Review discipline:
+    - Apply the rules below strictly. Only flag what is visible in the diff.
+    - For each finding, cite the exact added/changed line. Do not flag context lines.
+    - Assess blast radius: data corruption, safety hazard, exploitability, or schedule risk.
+    - Be precise — one clear sentence per issue, no padding.
+
+  metadata:
+    version: "3.0.0"
+    last_modified: "2026-04-07"
+    modified_by: "system"
+
+  rules:
+    # ── Type Safety ────────────────────────────────────────────────────────────
+    - id: no-implicit-narrowing-cast
+      category: type-safety
+      severity: warning
+      enabled: true
+      title: "No implicit narrowing or sign-change casts"
+      description: >
+        Implicit conversion that truncates a value or changes signedness silently
+        corrupts data. Flag only conversions on added/changed lines where the source
+        type is wider than the destination, or where signed/unsigned boundary is crossed
+        without an explicit cast and a comment justifying safety.
+      suggestion: "Add an explicit cast and a comment documenting the invariant, or redesign to avoid the conversion"
+
+    # ── Pointer & Bounds Safety ────────────────────────────────────────────────
+    - id: null-check-required
+      category: safety
+      severity: error
+      enabled: true
+      title: "Check NULL before pointer dereference"
+      description: >
+        Flag pointer dereferences on added/changed lines where the pointer:
+        (a) comes from a function that can return NULL (malloc, HAL init, queue peek),
+        (b) is a parameter with no prior NULL guard in the same function, or
+        (c) is cast from an integer or void*.
+        Do NOT flag: address-of (&var), pointers from static allocation, or pointers
+        already guarded by an if/assert on a preceding line in the same diff hunk.
+      suggestion: "Add: if (ptr != NULL) { ... } before the dereference"
+
+    - id: unsafe-string-functions
+      category: safety
+      severity: error
+      enabled: true
+      title: "Unsafe string/memory functions"
+      description: >
+        strcpy, strcat, sprintf, gets, and scanf with %s have no length parameter and
+        cause buffer overflows when the source exceeds the destination size.
+        Flag any added/changed line that calls these functions.
+      suggestion: "Replace with bounded equivalents: strncpy, strncat, snprintf, fgets"
+
+    - id: bounds-check
+      category: safety
+      severity: error
+      enabled: true
+      title: "Array index from external or variable source must be bounds-checked"
+      description: >
+        Flag array accesses on added/changed lines ONLY when the index is:
+        (a) derived from external input (UART, CAN, USB, SPI, network payload),
+        (b) a function parameter with no documented upper bound, or
+        (c) the result of arithmetic without a preceding bounds assertion.
+        Do NOT flag accesses where the index is a literal constant or a loop variable
+        whose range is provably limited by the loop condition on adjacent lines.
+      suggestion: "Add: if (idx < ARRAY_SIZE(arr)) { ... } before the access"
+
+    - id: dma-cache-coherency
+      category: safety
+      severity: error
+      enabled: true
+      title: "DMA buffer cache coherency"
+      description: >
+        On Cortex-M7/A-class cores with data cache enabled, DMA reads stale cache
+        lines and DMA writes are overwritten by cache writeback unless the software
+        explicitly manages coherency. Flag DMA start calls on added lines that lack
+        an adjacent SCB_CleanDCache_by_Addr (before TX) or SCB_InvalidateDCache_by_Addr
+        (after RX) call.
+      suggestion: "Call SCB_CleanDCache_by_Addr() before TX DMA start; SCB_InvalidateDCache_by_Addr() after RX DMA complete"
+
+    # ── ISR Safety ─────────────────────────────────────────────────────────────
+    - id: no-malloc-isr
+      category: isr-safety
+      severity: error
+      enabled: true
+      title: "No dynamic allocation in ISR"
+      description: >
+        malloc, free, pvPortMalloc, and vPortFree are not reentrant and must never
+        be called from an interrupt handler. They can corrupt the heap and cause
+        hard faults. Use statically allocated buffers or lock-free ring buffers instead.
+      suggestion: "Replace with a static buffer, a pre-allocated pool, or a lock-free ring buffer"
+
+    - id: volatile-shared
+      category: isr-safety
+      severity: error
+      enabled: true
+      title: "Variables shared with ISR must be volatile"
+      description: >
+        The compiler may cache a non-volatile variable in a register and never reload
+        it from memory, causing the main-loop code to see a stale value after the ISR
+        updates it. Flag added/changed declarations of variables that are written in
+        an ISR and read outside it (or vice-versa) without the volatile qualifier.
+      suggestion: "Declare as: volatile <type> varName;"
+
+    - id: critical-section
+      category: isr-safety
+      severity: error
+      enabled: true
+      title: "Shared data access must be in a critical section"
+      description: >
+        Multi-byte variables (structs, 64-bit values) and multi-step read-modify-write
+        sequences shared between ISR and task/main context are not atomic and must be
+        protected. Flag added/changed accesses that lack taskENTER_CRITICAL /
+        taskEXIT_CRITICAL (FreeRTOS) or __disable_irq / __enable_irq (bare-metal).
+      suggestion: "Wrap with taskENTER_CRITICAL() / taskEXIT_CRITICAL() or __disable_irq() / __enable_irq()"
+
+    - id: no-blocking-isr
+      category: isr-safety
+      severity: error
+      enabled: true
+      title: "No blocking calls in ISR"
+      description: >
+        vTaskDelay, HAL_Delay, xSemaphoreTake with non-zero timeout, and any mutex
+        pend inside an ISR will deadlock or trigger a FreeRTOS assertion because the
+        scheduler cannot context-switch from interrupt context.
+      suggestion: "Use xSemaphoreGiveFromISR / xQueueSendFromISR and defer processing to a task via a notification"
+
+    # ── HAL / RTOS API Usage ───────────────────────────────────────────────────
+    - id: hal-return-check
+      category: api-usage
+      severity: warning
+      enabled: true
+      title: "Check HAL return values"
+      description: >
+        HAL_xxx() functions return HAL_OK, HAL_ERROR, HAL_BUSY, or HAL_TIMEOUT.
+        Ignoring the return value silently propagates failures and makes root-cause
+        analysis impossible. Flag added/changed calls where the return value is
+        discarded (result not stored, not checked with if/assert, not returned).
+      suggestion: "if (HAL_xxx(...) != HAL_OK) { Error_Handler(); }"
+
+    - id: rtos-api-return-check
+      category: api-usage
+      severity: warning
+      enabled: true
+      title: "Check FreeRTOS API return values"
+      description: >
+        xQueueSend, xSemaphoreTake, xTaskCreate, xTimerStart, and similar RTOS calls
+        return pdPASS / pdFAIL / errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY. Ignoring
+        these masks resource exhaustion and scheduling failures. Flag added/changed
+        calls where the return value is discarded.
+      suggestion: "if (xQueueSend(...) != pdPASS) { /* handle queue full */ }"
+
+    # ── Reliability ────────────────────────────────────────────────────────────
+    - id: watchdog-in-error-handler
+      category: reliability
+      severity: error
+      enabled: true
+      title: "No watchdog refresh inside error or fault handlers"
+      description: >
+        Refreshing IWDG or WWDG inside Error_Handler(), HardFault_Handler(), or any
+        assert-fail handler masks the fault condition and prevents the automatic reset
+        that is the last line of defence. The watchdog should only be kicked on the
+        nominal execution path.
+      suggestion: "Remove HAL_IWDG_Refresh() / WWDG kicks from all error and fault handlers"
+
+    - id: error-code-propagation
+      category: reliability
+      severity: warning
+      enabled: true
+      title: "Do not silently discard error codes"
+      description: >
+        Discarding a non-OK status from a driver, RTOS, or HAL API without logging,
+        asserting, or propagating it makes the system appear healthy when it is not,
+        and makes field debugging impossible. Flag added/changed code that receives
+        a status value and does nothing with it.
+      suggestion: "Store the status, log it (e.g. via a debug UART), assert in debug builds, or return it to the caller"
+
+    - id: switch-default-safe-state
+      category: reliability
+      severity: warning
+      enabled: true
+      title: "Every switch on an enum must have a default case"
+      description: >
+        A switch statement over an enum with no default silently ignores values added
+        to the enum later or invalid values injected via casting. This causes undefined
+        behaviour. Flag added/changed switch statements that are missing a default branch.
+      suggestion: "Add: default: ASSERT(false); /* or enter a defined safe state */"
+
+    - id: no-unbounded-recursion
+      category: reliability
+      severity: error
+      enabled: true
+      title: "No unbounded recursion"
+      description: >
+        Embedded targets have 4–32 KB of stack. Any recursive call without a provably
+        bounded depth can overflow the stack silently (no MMU guard page on most Cortex-M).
+        Flag added/changed functions that call themselves directly or indirectly without
+        a documented tight depth bound.
+      suggestion: "Rewrite as iteration, or add a depth counter with an assert/return when the limit is reached"
+
+    - id: resource-release-on-all-paths
+      category: reliability
+      severity: error
+      enabled: true
+      title: "Release all acquired resources on every exit path"
+      description: >
+        Semaphores, mutexes, DMA handles, and peripheral locks acquired in a function
+        must be released on every return path, including error returns. Missing releases
+        cause permanent deadlocks and resource exhaustion that only manifest under load.
+        Flag added/changed functions that acquire a resource but have a return path
+        that does not release it.
+      suggestion: "Use a cleanup goto pattern or extract a RAII-style wrapper to guarantee release on all paths"
+
+    # ── Coding Standards ───────────────────────────────────────────────────────
+    - id: magic-numbers
+      category: maintainability
+      severity: suggestion
+      enabled: true
+      title: "Replace magic numbers with named constants"
+      description: >
+        Flag numeric literals on added/changed lines ONLY when the value is non-obvious
+        and has domain meaning — hardware register offsets, buffer sizes, timeout values,
+        protocol field lengths, bitmasks. Do NOT flag: 0, 1, -1, NULL, array indices
+        in a trivially clear loop (i < 3), bit-shift amounts that are self-documenting
+        (1U << 4), or values in a comment.
+      suggestion: "Define as: #define SYMBOL_NAME (value)U  or  static constexpr U32 kSymbolName = value;"
+
+    - id: const-correctness
+      category: maintainability
+      severity: warning
+      enabled: true
+      title: "Read-only data must be declared const"
+      description: >
+        On most embedded toolchains, const global/static data is placed in flash (ROM)
+        rather than RAM. Non-const data is copied to RAM at startup, wasting scarce
+        SRAM. Flag added/changed global or static variables that are never written
+        after initialisation and lack the const qualifier.
+        Also flag pointer parameters that point to data the function never modifies
+        but lack const on the pointed-to type.
+      suggestion: "Add const qualifier: const U8 kTable[] = {...}; or void fn(const U8 *buf, U16 len);"
+
+    - id: static-file-scope
+      category: maintainability
+      severity: suggestion
+      enabled: true
+      title: "File-scoped symbols must be declared static"
+      description: >
+        Functions and variables at file scope that are not part of a module's public
+        API should be declared static to prevent accidental linkage collisions across
+        translation units and to allow the compiler to inline or eliminate them.
+        Flag added/changed non-static file-scope functions and variables that have no
+        corresponding declaration in a header file visible in the diff.
+      suggestion: "Add static keyword: static void helperFn(void); or static U32 s_moduleState;"
+
+    # ── Product Security ───────────────────────────────────────────────────────
+    - id: no-hardcoded-credentials
+      category: security
+      severity: error
+      enabled: true
+      title: "No hardcoded credentials or cryptographic keys"
+      description: >
+        Hardcoded passwords, API keys, symmetric keys, or certificate private keys
+        embedded in firmware are trivially extractable by reading flash. Flag any
+        added/changed string or byte array literal that resembles a secret: long hex
+        strings, base64 blobs, strings containing "key", "password", "token", "secret".
+      suggestion: "Provision secrets into protected flash/OTP/secure element at manufacturing; never embed in source"
+
+    - id: external-input-validation
+      category: security
+      severity: error
+      enabled: true
+      title: "Validate and sanitise all external inputs before use"
+      description: >
+        Data arriving over UART, CAN, USB, SPI slave, Ethernet, or any radio interface
+        must have its length checked against the receive buffer size and its content
+        validated (CRC, framing, type field) before being copied or parsed. Skipping
+        this step enables stack overflows, heap overflows, and protocol confusion attacks.
+        Flag added/changed code that reads from a peripheral and immediately passes the
+        data to a copy, parse, or dispatch function without a length/validity check.
+      suggestion: "Check: len <= sizeof(buf), validate CRC/framing, reject malformed packets before processing payload"
+
+    - id: integer-overflow-security
+      category: security
+      severity: error
+      enabled: true
+      title: "Check integer arithmetic in length/offset calculations"
+      description: >
+        Integer overflow in size, length, or offset arithmetic used for memory
+        allocation or bounds checks wraps silently on unsigned types and produces
+        a dangerously small value, enabling buffer overflows. Flag added/changed
+        expressions of the form (a + b), (a * b), or (a - b) that are used as a
+        buffer size, array index, or memcpy length without a prior overflow check.
+      suggestion: "Guard with: if (b > SIZE_MAX - a) { return E_OVERFLOW; } before using the sum"
+
+    - id: weak-crypto-forbidden
+      category: security
+      severity: error
+      enabled: true
+      title: "Weak or broken cryptographic algorithms forbidden"
+      description: >
+        MD5, SHA-1, DES, 3DES, RC4, and any custom or homebrew cipher provide
+        inadequate security against modern attacks. Flag added/changed code that
+        references these algorithms by name or by their standard OID constants.
+      suggestion: "Use AES-128 or stronger, SHA-256 or stronger, ECDSA P-256+ or RSA-2048+ for asymmetric operations"

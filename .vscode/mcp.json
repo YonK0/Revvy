@@ -1,0 +1,86 @@
+{
+  "inputs": [
+    // ── Atlassian (Jira + Confluence) ─────────────────────────────────────────
+    {
+      "id": "jira-url",
+      "type": "promptString",
+      "description": "Jira base URL — e.g. https://yourcompany.atlassian.net"
+    },
+    {
+      "id": "confluence-url",
+      "type": "promptString",
+      "description": "Confluence base URL — can be the same as your Jira URL"
+    },
+    {
+      "id": "atlassian-username",
+      "type": "promptString",
+      "description": "Atlassian account email address"
+    },
+    {
+      "id": "atlassian-token",
+      "type": "promptString",
+      "description": "Atlassian API token — create one at https://id.atlassian.com/manage-profile/security/api-tokens",
+      "password": true
+    },
+    // ── GitHub ────────────────────────────────────────────────────────────────
+    {
+      "id": "github-token",
+      "type": "promptString",
+      "description": "GitHub Personal Access Token (repo + pull_requests read scope) — https://github.com/settings/tokens",
+      "password": true
+    },
+    // ── GitLab ────────────────────────────────────────────────────────────────
+    {
+      "id": "gitlab-url",
+      "type": "promptString",
+      "description": "GitLab base URL — e.g. https://gitlab.com or your self-hosted instance URL"
+    },
+    {
+      "id": "gitlab-token",
+      "type": "promptString",
+      "description": "GitLab Personal Access Token (read_api scope) — User Settings > Access Tokens",
+      "password": true
+    }
+  ],
+  "servers": {
+    // ── Atlassian (Jira + Confluence) ─────────────────────────────────────────
+    // Install: pip install mcp-atlassian
+    // Docs: https://github.com/sooperset/mcp-atlassian
+    "atlassian": {
+      "type": "stdio",
+      "command": "mcp-atlassian",
+      "env": {
+        "JIRA_URL": "${input:jira-url}",
+        "JIRA_USERNAME": "${input:atlassian-username}",
+        "JIRA_API_TOKEN": "${input:atlassian-token}",
+        "CONFLUENCE_URL": "${input:confluence-url}",
+        "CONFLUENCE_USERNAME": "${input:atlassian-username}",
+        "CONFLUENCE_API_TOKEN": "${input:atlassian-token}"
+      }
+    },
+    // ── GitHub ────────────────────────────────────────────────────────────────
+    // Provides: get_pull_request, get_pull_request_files, get_pull_request_diff, etc.
+    // Docs: https://github.com/github/github-mcp-server
+    "github": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN=${input:github-token}",
+        "ghcr.io/github/github-mcp-server:latest"
+      ]
+    },
+    // ── GitLab ────────────────────────────────────────────────────────────────
+    // Provides: get_merge_request, get_merge_request_diffs, list_merge_requests, etc.
+    // Docs: https://github.com/modelcontextprotocol/servers/tree/main/src/gitlab
+    "gitlab": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-gitlab"],
+      "env": {
+        "GITLAB_PERSONAL_ACCESS_TOKEN": "${input:gitlab-token}",
+        "GITLAB_API_URL": "${input:gitlab-url}"
+      }
+    }
+  }
+}

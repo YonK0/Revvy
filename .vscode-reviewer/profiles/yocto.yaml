@@ -1,0 +1,61 @@
+# Yocto/OpenEmbedded Review Profile
+profile:
+  id: yocto
+  label: "Yocto / OpenEmbedded"
+  description: "BitBake recipes, layers, kernel config"
+  icon: "$(layers)"
+  file_patterns:
+    - "**/*.bb"
+    - "**/*.bbappend"
+    - "**/*.bbclass"
+    - "**/*.conf"
+    - "**/*.inc"
+
+  system_prompt_extra: |
+    You are reviewing Yocto/OpenEmbedded build system code.
+    Focus on:
+    - SRC_URI checksums (md5/sha256)
+    - LICENSE field with SPDX identifiers
+    - RDEPENDS vs DEPENDS correctness
+    - do_install using install command (not cp)
+    - Layer compatibility
+
+  metadata:
+    version: "1.0.0"
+    last_modified: "2026-03-08"
+
+  rules:
+    - id: src-uri-checksum
+      category: build-system
+      severity: error
+      enabled: true
+      title: "SRC_URI must have checksums"
+      description: "All SRC_URI entries need sha256sum and md5sum"
+
+    - id: spdx-license
+      category: licensing
+      severity: error
+      enabled: true
+      title: "Use SPDX license identifiers"
+      description: "LICENSE field must use valid SPDX identifiers"
+
+    - id: rdepends-vs-depends
+      category: dependencies
+      severity: warning
+      enabled: true
+      title: "RDEPENDS vs DEPENDS"
+      description: "Runtime deps in RDEPENDS, build deps in DEPENDS"
+
+    - id: do-install-permissions
+      category: packaging
+      severity: warning
+      enabled: true
+      title: "Use install command"
+      description: "Use install -m instead of cp in do_install"
+
+    - id: layerseries-compat
+      category: compatibility
+      severity: error
+      enabled: true
+      title: "LAYERSERIES_COMPAT required"
+      description: "layer.conf must declare LAYERSERIES_COMPAT"
