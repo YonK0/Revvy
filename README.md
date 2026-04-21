@@ -57,7 +57,8 @@ Not quite. Revvy also:
 
 ## Demo
 
-https://github.com/user-attachments/assets/a218557e-2baf-4a97-aa86-1e86361e306b
+<img width="800" height="450" alt="revvy" src="https://github.com/user-attachments/assets/d34de152-fd9d-40a2-99f6-a3a13ff04b29" />
+
 
 
 
