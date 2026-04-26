@@ -415,7 +415,65 @@ profile:
     fs.writeFileSync(path.join(this.rulesPath, 'yocto.yaml'), yoctoYaml);
     fs.writeFileSync(path.join(this.rulesPath, 'python.yaml'), pythonYaml);
 
-    this.logger('Created default YAML profiles: c-embedded, yocto, python');
+    // Commit-style profile: universal rules for commit message generation.
+    // Not a domain profile — never shown in the active profile selector.
+    const commitStyleYaml = `# Commit Message Style Profile
+# Universal rules that apply to every team regardless of domain.
+# Used exclusively for commit message generation — never mixed into code review findings.
+profile:
+  id: commit-style
+  label: "Commit Message Style"
+  description: "Universal commit message format rules — applies to all teams"
+  icon: "$(git-commit)"
+  file_patterns:
+    - "**/*"
+  system_prompt_extra: ""
+  metadata:
+    version: "1.0.0"
+    last_modified: "2026-04-25"
+    modified_by: "system"
+  rules:
+    - id: commit-conventional-format
+      category: commit-message
+      severity: error
+      enabled: true
+      title: "Use conventional commit format"
+      description: "Every subject must start with a type prefix: feat|fix|refactor|chore|docs|test|perf|style|ci|build. Optional scope in parens: feat(scope): message."
+      suggestion: "e.g. fix(isr): add volatile guard for shared counter flag"
+
+    - id: commit-subject-length
+      category: commit-message
+      severity: error
+      enabled: true
+      title: "Subject line ≤72 characters"
+      description: "First line must not exceed 72 characters. Use a body paragraph after a blank line for detail."
+      suggestion: "Break long descriptions into subject + body separated by a blank line"
+
+    - id: commit-imperative-mood
+      category: commit-message
+      severity: warning
+      enabled: true
+      title: "Use imperative mood in subject"
+      description: "Write as a command. Correct: 'add null check'. Wrong: 'added null check' or 'adds null check'."
+
+    - id: commit-no-period
+      category: commit-message
+      severity: suggestion
+      enabled: true
+      title: "No trailing period on subject line"
+      description: "The subject line must not end with a period or other punctuation mark."
+
+    - id: commit-no-vague-words
+      category: commit-message
+      severity: warning
+      enabled: true
+      title: "Avoid vague commit words"
+      description: "Do not use vague words like 'fix', 'update', 'change', 'misc', 'wip' as the entire subject. Describe WHAT and WHY."
+      suggestion: "Be specific: 'fix(sensor): prevent divide-by-zero when sample rate is zero'"
+`;
+    fs.writeFileSync(path.join(this.rulesPath, 'commit-style.yaml'), commitStyleYaml);
+
+    this.logger('Created default YAML profiles: c-embedded, yocto, python, commit-style');
   }
 
   /**

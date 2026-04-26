@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(unzip -o \"Smart Code Reviewer Design.zip\" -d \"Smart Code Reviewer Design\")",
-      "Bash(npx tsc:*)"
-    ]
-  }
-}

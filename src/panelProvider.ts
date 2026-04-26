@@ -67,6 +67,14 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
             vscode.window.showInformationMessage('Review copied to clipboard');
           }
           break;
+        case 'setReviewMode':
+          await this.context.workspaceState.update('revvy.reviewMode', msg.mode);
+          break;
+        case 'getReviewMode': {
+          const savedMode = this.context.workspaceState.get<string>('revvy.reviewMode', 'per_file');
+          webviewView.webview.postMessage({ type: 'reviewMode', mode: savedMode });
+          break;
+        }
       }
     });
   }
@@ -214,6 +222,14 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
         t.steps.forEach((s, j) => { md += `${j + 1}. ${s}\n`; });
         md += '\n';
       });
+    }
+
+    if (r.commitMessages && r.commitMessages.length > 0) {
+      md += `---\n\n## Suggested Commit Messages\n\n`;
+      r.commitMessages.forEach((msg, i) => {
+        md += `${i + 1}. \`${msg}\`\n`;
+      });
+      md += '\n';
     }
 
     md += `---\n\n*Apply every fix above. When done, confirm which files were changed.*\n`;
@@ -383,6 +399,7 @@ body {
   .req-label-active { background: rgba(88,166,255,0.12); color: var(--accent-fg); }
   .req-clear-btn { margin-left:auto; display:flex; align-items:center; padding:2px 4px; border-radius:4px; color:var(--fg-subtle); background:transparent; border:none; cursor:pointer; }
   .req-clear-btn:hover { color:var(--fg-default); background:var(--bg-muted); }
+
 .toolbar-btn svg  { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 
 /* ── Bottom bar / toolbar ── */
@@ -664,6 +681,18 @@ body {
         </button>
       </div>
 
+      <!-- Review mode selector -->
+      <div class="model-section" style="border-bottom:1px solid var(--border-muted)">
+        <div class="model-section-label">
+          <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="1"/><rect x="2" y="14" width="10" height="7" rx="1"/><rect x="16" y="14" width="6" height="7" rx="1"/></svg>
+          Review mode
+        </div>
+        <div class="filter-group">
+          <button id="mode-per-file" class="filter-chip active">Per file</button>
+          <button id="mode-all-in-one" class="filter-chip">All in one</button>
+        </div>
+      </div>
+
       <!-- Secondary actions -->
       <div class="actions">
         <button class="btn-secondary" onclick="vscode.postMessage({type:'selectProfile'})">
@@ -687,7 +716,7 @@ body {
         </button>
         `}
         <button class="btn-secondary" onclick="vscode.postMessage({type:'reviewMultiMR'})">
-          ${this.icons.repoForked}<span>Review Multiple MRs</span>
+          ${this.icons.repoForked}<span>Review Remote MRs</span>
           <span class="label-right">MCP</span>
         </button>
       </div>
@@ -706,6 +735,7 @@ body {
         </div>
       </div>
     </div>
+    <p style="padding:12px 20px 16px;font-size:10px;color:var(--fg-subtle);margin:0;line-height:1.5">&#9432; &ldquo;All in one&rdquo; works best when the MR is small in both dimensions: fewer than ~5 files and under ~300 lines of diff. Use &ldquo;Per file&rdquo; otherwise.</p>
   </div>
 
   <script>
@@ -724,8 +754,29 @@ body {
           sel.disabled = false;
         }
       }
+      if (msg.type === 'reviewMode') {
+        const pfb = document.getElementById('mode-per-file');
+        const aiob = document.getElementById('mode-all-in-one');
+        if (pfb && aiob) {
+          pfb.classList.toggle('active', msg.mode === 'per_file');
+          aiob.classList.toggle('active', msg.mode === 'all_in_one');
+        }
+      }
     });
     vscode.postMessage({ type: 'requestModels' });
+    (function setupModeToggle() {
+      const pfb = document.getElementById('mode-per-file');
+      const aiob = document.getElementById('mode-all-in-one');
+      if (!pfb || !aiob) { return; }
+      function setMode(mode) {
+        pfb.classList.toggle('active', mode === 'per_file');
+        aiob.classList.toggle('active', mode === 'all_in_one');
+        vscode.postMessage({ type: 'setReviewMode', mode: mode });
+      }
+      pfb.addEventListener('click', function() { setMode('per_file'); });
+      aiob.addEventListener('click', function() { setMode('all_in_one'); });
+      vscode.postMessage({ type: 'getReviewMode' });
+    })();
   </script>
 </body>
 </html>`;
@@ -896,7 +947,31 @@ body {
     border: 1px solid var(--sev-error-border, rgba(248, 81, 73, 0.3));
     border-radius: 6px;
     padding: 10px 14px;
+    margin-bottom: 18px;
   }
+
+  .error-actions {
+    display: flex; gap: 8px; justify-content: center;
+  }
+
+  .go-home-btn, .try-again-btn {
+    font-size: 12px; font-weight: 500;
+    padding: 6px 14px; border-radius: 6px;
+    border: 1px solid var(--border-default);
+    cursor: pointer; font-family: var(--font-sans);
+    transition: opacity 0.15s;
+  }
+
+  .go-home-btn {
+    background: var(--bg-subtle); color: var(--fg-default);
+  }
+
+  .try-again-btn {
+    background: var(--accent-emphasis, #1f6feb);
+    color: #fff; border-color: transparent;
+  }
+
+  .go-home-btn:hover, .try-again-btn:hover { opacity: 0.85; }
 </style>
 </head>
 <body>
@@ -904,6 +979,12 @@ body {
     <div class="error-icon">⚠️</div>
     <div class="error-title">Could not fetch diff</div>
     <div class="error-message">${message.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
+    <div class="error-actions">
+      <button class="go-home-btn"
+        onclick="acquireVsCodeApi().postMessage({type:'goHome'})">Back to Home</button>
+      <button class="try-again-btn"
+        onclick="acquireVsCodeApi().postMessage({type:'runReview'})">Try Again</button>
+    </div>
   </div>
 </body>
 </html>`;
@@ -1087,11 +1168,11 @@ body {
       if (isRemote) {
         // Part 3 fix: show file + line info in fallback instead of generic message
         codeSnippet = c.codeContext
-          ? this.renderDiffContext(c.codeContext, c.codeContextStartLine ?? c.line, c.line, c.endLine)
+          ? this.renderDiffContext(c.codeContext, c.codeContextStartLine ?? c.line, c.line, c.endLine, c.codeFragment)
           : `<div class="card-code-unavailable">Diff unavailable for ${escapedFile} line ${c.line}.</div>`;
       } else {
         const fileLines = fileLinesCache.get(c.file);
-        codeSnippet = this.renderCodeLine(fileLines, c.line, c.endLine);
+        codeSnippet = this.renderCodeLine(fileLines, c.line, c.endLine, c.codeFragment);
       }
 
       // Remote cards are inert — no local file to navigate to.
@@ -1455,6 +1536,9 @@ body {
     <!-- Tests -->
     ${this.renderTestsHtml(r.tests)}
 
+    <!-- Commit Messages (local reviews only) -->
+    ${this.renderCommitMessagesHtml(r.commitMessages ?? [])}
+
   </div>
 
   <!-- Bottom Toolbar -->
@@ -1471,8 +1555,7 @@ body {
       </button>
     </div>
     <div class="meta-footer">${this.escapeHtml(r.backendUsed)} &middot; ${(r.durationMs / 1000).toFixed(1)}s</div>
-  </div>
-</div>
+      </div>
 
 <script>
   const vscode = acquireVsCodeApi();
@@ -1565,6 +1648,39 @@ body {
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--fg-subtle)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.15s"><path d="m6 9 6 6 6-6"/></svg>
         </button>
         <div id="${testId}" hidden style="border-top:1px solid var(--border-default);padding:10px 12px">${testItems}</div>
+      </div>`;
+  }
+
+  private renderCommitMessagesHtml(messages: string[]): string {
+    if (!messages || messages.length === 0) { return ''; }
+
+    const msgItems = messages.map((msg, idx) => {
+      const escaped = this.escapeHtml(msg);
+      const copyId  = `commit-copy-${idx}`;
+      return `
+        <div style="margin-bottom:${idx < messages.length - 1 ? '8px' : '0'};position:relative">
+          <div style="font-family:var(--font-mono,'Menlo','Consolas',monospace);font-size:11px;color:var(--fg-default);background:var(--bg-subtle);border:1px solid var(--border-default);border-radius:5px;padding:7px 36px 7px 10px;line-height:1.5;word-break:break-word">${escaped}</div>
+          <button id="${copyId}"
+            onclick="(function(btn,text){navigator.clipboard.writeText(text).then(function(){var orig=btn.innerHTML;btn.innerHTML='✓';setTimeout(function(){btn.innerHTML=orig;},1200);});})(this,${JSON.stringify(msg)})"
+            title="Copy to clipboard"
+            style="position:absolute;top:5px;right:6px;padding:2px 5px;font-size:10px;background:var(--bg-muted);border:1px solid var(--border-default);border-radius:4px;cursor:pointer;color:var(--fg-muted);font-family:var(--font-sans)">
+            Copy
+          </button>
+        </div>`;
+    }).join('');
+
+    const bodyId = 'commit-msgs-body';
+    return `
+      <div style="margin:10px 10px 10px;background:var(--bg-overlay);border:1px solid var(--border-default);border-radius:8px;overflow:hidden">
+        <button onclick="toggleFix('${bodyId}',this)" style="width:100%;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:transparent;border:none;cursor:pointer;font-family:var(--font-sans)">
+          <div style="display:flex;align-items:center;gap:6px">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-fg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><line x1="3" y1="12" x2="9" y2="12"/><line x1="15" y1="12" x2="21" y2="12"/></svg>
+            <span style="font-size:11px;font-weight:600;color:var(--accent-fg)">Suggested Commit Messages</span>
+            <span style="font-size:10px;color:var(--fg-subtle);font-weight:400">${messages.length}</span>
+          </div>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--fg-subtle)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.15s"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div id="${bodyId}" hidden style="border-top:1px solid var(--border-default);padding:10px 12px">${msgItems}</div>
       </div>`;
   }
 
@@ -1792,6 +1908,7 @@ body {
     fileLines: string[] | undefined,
     startLine: number,
     endLine: number | undefined,
+    codeFragment?: string,
   ): string {
     if (!fileLines || fileLines.length === 0) {
       return `<div class="card-code-unavailable">Source file not found in workspace.</div>`;
@@ -1804,6 +1921,26 @@ body {
     let flagLast  = (endLine !== undefined && endLine > 0)
       ? Math.min(total, Math.max(flagFirst, endLine))
       : flagFirst;
+
+    // If the AI provided a verbatim code fragment, search for it within a
+    // ±10-line window around the AI-reported line to find the true position.
+    // This corrects cases where the AI's line number is off by a few lines.
+    if (codeFragment) {
+      const fragFirstLine = codeFragment.split('\n')[0].replace(/^[+\- ]/, '').trim();
+      const fragLineCount = codeFragment.split('\n').length;
+      const MIN_FRAG_LEN = 8;
+      if (fragFirstLine.length >= MIN_FRAG_LEN) {
+        const searchStart = Math.max(1, flagFirst - 50);
+        const searchEnd   = Math.min(total, flagFirst + 50);
+        for (let ln = searchStart; ln <= searchEnd; ln++) {
+          if ((fileLines[ln - 1] ?? '').trim().includes(fragFirstLine)) {
+            flagFirst = ln;
+            flagLast  = Math.min(total, ln + fragLineCount - 1);
+            break;
+          }
+        }
+      }
+    }
 
     // If the flagged range is all blank, scan ±5 for nearest non-empty line
     const rangeBlank = (a: number, b: number) => {
@@ -1867,14 +2004,34 @@ body {
     contextStartLine: number,
     flagFirst: number,
     flagLast: number | undefined,
+    codeFragment?: string,
   ): string {
     const lines = codeContext.split('\n');
-    const fLast = (flagLast !== undefined && flagLast >= flagFirst) ? flagLast : flagFirst;
+    let fFirst = flagFirst;
+    let fLast  = (flagLast !== undefined && flagLast >= flagFirst) ? flagLast : flagFirst;
+
+    // If the AI provided a verbatim code fragment, locate it within the
+    // extracted context window and use that position for the highlight instead
+    // of the AI's (sometimes inaccurate) line number.
+    if (codeFragment) {
+      const fragFirstLine = codeFragment.split('\n')[0].replace(/^[+\- ]/, '').trim();
+      const fragLineCount = codeFragment.split('\n').length;
+      const MIN_FRAG_LEN = 8;
+      if (fragFirstLine.length >= MIN_FRAG_LEN) {
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].trim().includes(fragFirstLine)) {
+            fFirst = contextStartLine + i;
+            fLast  = fFirst + fragLineCount - 1;
+            break;
+          }
+        }
+      }
+    }
 
     const rows = lines.map((raw, i) => {
       const ln        = contextStartLine + i;
       const html      = this.highlightCode(raw.replace(/\t/g, '  '));
-      const isFlagged = ln >= flagFirst && ln <= fLast;
+      const isFlagged = ln >= fFirst && ln <= fLast;
       const rowClass  = isFlagged ? 'card-code-row card-code-row-flagged' : 'card-code-row card-code-row-ctx';
       return (
         `<div class="${rowClass}">` +

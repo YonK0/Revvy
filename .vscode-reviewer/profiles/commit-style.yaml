@@ -1,0 +1,69 @@
+# Commit Message Style Profile
+# Universal rules that apply to every team regardless of domain.
+# These rules are used exclusively for commit message generation — they are
+# never mixed into code review findings.
+profile:
+  id: commit-style
+  label: "Commit Message Style"
+  description: "Universal commit message format rules — applies to all teams"
+  icon: "$(git-commit)"
+  file_patterns:
+    - "**/*"
+
+  system_prompt_extra: ""
+
+  metadata:
+    version: "1.0.0"
+    last_modified: "2026-04-25"
+    modified_by: "system"
+
+  rules:
+    - id: commit-conventional-format
+      category: commit-message
+      severity: error
+      enabled: true
+      title: "Use conventional commit format"
+      description: >
+        Every commit subject must start with a type prefix followed by a colon and space.
+        Allowed types: feat, fix, refactor, chore, docs, test, perf, style, ci, build.
+        An optional scope in parentheses may follow the type: feat(scope): message.
+      suggestion: "e.g. fix(isr): add volatile guard for shared counter flag"
+
+    - id: commit-subject-length
+      category: commit-message
+      severity: error
+      enabled: true
+      title: "Subject line ≤72 characters"
+      description: >
+        The first line (subject) must not exceed 72 characters.
+        If more detail is needed, add a blank line after the subject
+        followed by a body paragraph.
+      suggestion: "Break long descriptions into a subject + body separated by a blank line"
+
+    - id: commit-imperative-mood
+      category: commit-message
+      severity: warning
+      enabled: true
+      title: "Use imperative mood in subject"
+      description: >
+        Write the subject as a command: what the commit does, not what was done.
+        Correct: 'add null check before pointer dereference'
+        Wrong: 'added null check' or 'adds null check'
+
+    - id: commit-no-period
+      category: commit-message
+      severity: suggestion
+      enabled: true
+      title: "No trailing period on subject line"
+      description: "The subject line must not end with a period or other punctuation mark."
+
+    - id: commit-no-vague-words
+      category: commit-message
+      severity: warning
+      enabled: true
+      title: "Avoid vague commit words"
+      description: >
+        Do not use vague words like 'fix', 'update', 'change', 'misc', 'wip',
+        or 'stuff' as the entire subject. The message must describe WHAT was
+        fixed or updated and WHY.
+      suggestion: "Be specific: 'fix(sensor): prevent divide-by-zero when sample rate is zero'"
