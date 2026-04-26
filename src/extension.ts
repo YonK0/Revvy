@@ -412,7 +412,13 @@ async function runReviewWithProgress(
           }
         };
 
-        const result = await runReview(diff, profileWithReqs, undefined, keys, onChunk);
+        const result = await runReview(
+          diff, profileWithReqs, undefined, keys, onChunk,
+          // Resolve commit-style rules once per review — never for remote reviews
+          // (sources=undefined here means this is always a local diff review).
+          ruleLoader?.getProfile('commit-style')?.rules.filter(r => r.enabled) ?? [],
+          extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
+        );
 
         if (result.filterStats && result.filterStats.skippedFiles > 0) {
           console.log(
@@ -678,6 +684,25 @@ function extractTextFromToolResult(result: any): string {
  * Tries multiple tool names and input key variants to handle different
  * @modelcontextprotocol/server-github and server-gitlab versions.
  */
+/**
+ * Inspects a tool's inputSchema.properties to pick the correct parameter name
+ * from a priority-ordered list of candidates.  Returns the first candidate
+ * that appears as a declared property, or the first candidate as a fallback
+ * when the schema is unavailable (preserving old behaviour without an extra
+ * invokeTool call).
+ */
+function pickParamName(tool: any, candidates: string[]): string {
+  const props: Record<string, unknown> =
+    tool?.inputSchema?.properties ?? tool?.input_schema?.properties ?? {};
+  for (const candidate of candidates) {
+    if (Object.prototype.hasOwnProperty.call(props, candidate)) {
+      return candidate;
+    }
+  }
+  // Schema absent or property not found — use the first candidate as default
+  return candidates[0];
+}
+
 async function fetchMrDiffViaMcp(ref: MrRef): Promise<string | null> {
   const lm = vscode.lm as any;
   if (typeof lm.invokeTool !== 'function') { return null; }
@@ -693,21 +718,23 @@ async function fetchMrDiffViaMcp(ref: MrRef): Promise<string | null> {
       tools.find((t: any) => { const n = (t.name ?? '').toLowerCase(); return n.includes('pull_request') && (n.includes('diff') || n.includes('file') || n.includes('content')); }) ??
       tools.find((t: any) => (t.name ?? '').toLowerCase().includes('pull_request'));
 
-    if (!tool) { return null; }
+    if (!tool) {
+      return null;
+    }
 
-    const inputs = [
-      { owner: ref.owner, repo: ref.repo, pullNumber: ref.number },
-      { owner: ref.owner, repo: ref.repo, pull_number: ref.number },
-      { owner: ref.owner, repo: ref.repo, pr_number: ref.number },
-    ];
-    for (const input of inputs) {
-      try {
-        const result = await lm.invokeTool(tool.name, { input }, cts.token);
-        const text = extractTextFromToolResult(result);
-        if (text) { return text; }
-      } catch (e: any) {
-        console.log(`[Revvy] GitHub tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
+    // Inspect the tool's schema once to pick the correct PR-number param name,
+    // so we only need a single invokeTool call (= single VS Code consent dialog).
+    const prKey = pickParamName(tool, ['pullNumber', 'pull_number', 'pr_number']);
+    const input = { owner: ref.owner, repo: ref.repo, [prKey]: ref.number };
+    console.log(`[Revvy] GitHub tool ${tool.name} — using param "${prKey}"`);
+    try {
+      const result = await lm.invokeTool(tool.name, { input }, cts.token);
+      const text = extractTextFromToolResult(result);
+      if (text) {
+        return text;
       }
+    } catch (e: any) {
+      console.log(`[Revvy] GitHub tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
     }
     return null;
   }
@@ -743,22 +770,23 @@ async function fetchMrDiffViaMcp(ref: MrRef): Promise<string | null> {
       return null;
     }
 
-    console.log(`[Revvy] Using GitLab tool: ${tool.name}`);
+    // Inspect the tool's schema once to pick the correct parameter names,
+    // so we only need a single invokeTool call (= single VS Code consent dialog).
+    const projectKey = pickParamName(tool, ['project_id', 'project', 'project_path']);
+    const mrKey      = pickParamName(tool, ['mr_iid', 'merge_request_iid', 'iid']);
     const projectPath = ref.owner ? `${ref.owner}/${ref.repo}` : ref.repo;
-    const inputs = [
-      { project_id: projectPath, mr_iid: ref.number },
-      { project: projectPath, merge_request_iid: ref.number },
-      { project_path: projectPath, iid: ref.number },
-    ];
+    const input = { [projectKey]: projectPath, [mrKey]: ref.number };
+    console.log(`[Revvy] Using GitLab tool: ${tool.name} — params "${projectKey}", "${mrKey}"`);
     const cts2 = new vscode.CancellationTokenSource();
-    for (const input of inputs) {
-      try {
-        const result = await lm.invokeTool(tool.name, { input }, cts2.token);
-        const text = extractTextFromToolResult(result);
-        if (text) { return normalizeGitLabDiffResponse(text); }
-      } catch (e: any) {
-        console.log(`[Revvy] GitLab tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
+    try {
+      const result = await lm.invokeTool(tool.name, { input }, cts2.token);
+      const text = extractTextFromToolResult(result);
+      if (text) {
+        const normalized = normalizeGitLabDiffResponse(text);
+        return normalized;
       }
+    } catch (e: any) {
+      console.log(`[Revvy] GitLab tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
     }
     return null;
   }
@@ -891,6 +919,7 @@ async function reviewMultiMR() {
       if (diffs.length === 0) { return; }
 
       const combinedDiff = diffs.join('\n\n');
+
       const keys = await getSecrets();
       // Inject in-memory requirements for this profile (same logic as runReviewWithProgress).
       const profileWithReqs: ReviewProfile =
@@ -918,7 +947,11 @@ async function reviewMultiMR() {
           }
         };
 
-        const result = await runReview(combinedDiff, profileWithReqs, sources, keys, onChunk);
+        const result = await runReview(
+          combinedDiff, profileWithReqs, sources, keys, onChunk,
+          undefined,
+          extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
+        );
 
         panelProvider.updateLoading('Done!', 1.0);
         await new Promise(r => setTimeout(r, 120));

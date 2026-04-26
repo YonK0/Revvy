@@ -37,6 +37,12 @@ export interface ReviewComment {
   codeContext?: string;
   /** 1-based line number of the first line stored in codeContext. */
   codeContextStartLine?: number;
+  /**
+   * Verbatim 1–3 lines copied from the diff by the AI identifying the exact
+   * code being flagged.  Used to correct the highlight when the AI's `line`
+   * number is slightly off from the actual offending code.
+   */
+  codeFragment?: string;
 }
 
 export interface ReviewSource {
@@ -79,7 +85,8 @@ function extractDiffContext(
   startLine: number,
   endLine: number | undefined,
   contextLines = 2,
-): { code: string; startLineNum: number } | undefined {
+  codeFragment?: string,
+): { code: string; startLineNum: number; correctedLine: number } | undefined {
   // Build newLineNum → codeLine map from the diff hunks.
   //
   // FIX 1 — bounded hunk consumer:
@@ -88,8 +95,9 @@ function extractDiffContext(
   // content after the hunk (appended JSON metadata, blank lines, next headers)
   // never touches lineMap.  This also eliminates the +++ b/filename bug: that
   // header is a non-@@ outer-loop line and is skipped by the else branch.
+  // Normalise Windows CRLF so \r never bleeds into lineMap values.
   const lineMap = new Map<number, string>();
-  const lines = fileDiff.split('\n');
+  const lines = fileDiff.replace(/\r\n/g, '\n').split('\n');
   let i = 0;
 
   while (i < lines.length) {
@@ -116,6 +124,10 @@ function extractDiffContext(
         } else if (line.startsWith('-')) {
           // removed line — no new-side line number; does not consume remaining
           i++;
+        } else if (line.startsWith('\\')) {
+          // "\ No newline at end of file" and similar diff metadata markers.
+          // Skip without breaking the hunk — remaining is unchanged.
+          i++;
         } else {
           // Non-diff content (metadata, next @@ header, blank line after hunk).
           // Stop consuming without advancing i — outer loop will re-process.
@@ -129,8 +141,42 @@ function extractDiffContext(
 
   if (lineMap.size === 0) { return undefined; }
 
-  const flagFirst = Math.max(1, startLine);
-  const flagLast  = (endLine !== undefined && endLine >= flagFirst) ? endLine : flagFirst;
+  // Shared distance cap used by both the fragment-guided correction (FIX 3) and
+  // the nearest-available-line fallback (FIX 2) below.
+  const MAX_FALLBACK_DIST = 30;
+
+  // FIX 3 — codeFragment-guided line correction:
+  // When the AI provides a verbatim codeFragment we search the full lineMap for
+  // the nearest entry whose text contains the fragment's first line.  This
+  // corrects cases where the AI's reported line number is off by more than
+  // ±contextLines — e.g. flagging the opening brace of a function when the
+  // actual violation is the parameter on the function signature line 4 lines
+  // later.  The search is bounded by MAX_FALLBACK_DIST so we never jump to a
+  // completely unrelated part of the diff.
+  let flagFirst = Math.max(1, startLine);
+  let flagLast  = (endLine !== undefined && endLine >= flagFirst) ? endLine : flagFirst;
+
+  if (codeFragment) {
+    const fragFirstLine = codeFragment.split('\n')[0].replace(/^[+\- ]/, '').trim();
+    const fragLineCount = codeFragment.split('\n').length;
+    const MIN_FRAG_LEN  = 8;
+    if (fragFirstLine.length >= MIN_FRAG_LEN) {
+      let bestLine = -1;
+      let bestDist = Infinity;
+      for (const [ln, code] of lineMap) {
+        const dist = Math.abs(ln - flagFirst);
+        if (dist <= MAX_FALLBACK_DIST && dist < bestDist && code.trim().includes(fragFirstLine)) {
+          bestLine = ln;
+          bestDist = dist;
+        }
+      }
+      if (bestLine !== -1) {
+        flagFirst = bestLine;
+        flagLast  = bestLine + fragLineCount - 1;
+      }
+    }
+  }
+
   const viewFirst = Math.max(1, flagFirst - contextLines);
   const viewLast  = flagLast + contextLines;
 
@@ -144,9 +190,10 @@ function extractDiffContext(
 
   // FIX 2 — nearest-available-line fallback:
   // If the AI flagged a line just outside the hunk's context window, the exact
-  // window produces no results.  Instead of returning undefined (which shows
-  // "Code not available"), find the line in lineMap nearest to flagFirst and
-  // return a contextLines-wide window around it.
+  // window produces no results.  Find the nearest in-diff line and return a
+  // contextLines-wide window around it — but only if it's within MAX_FALLBACK_DIST
+  // lines of the flagged line.  Beyond that threshold the snippet would be from
+  // a completely unrelated area of the file; "Code not available" is more honest.
   if (collected.length === 0) {
     let nearestLine = -1;
     let nearestDist = Infinity;
@@ -157,7 +204,7 @@ function extractDiffContext(
         nearestLine = ln;
       }
     }
-    if (nearestLine === -1) { return undefined; }
+    if (nearestLine === -1 || nearestDist > MAX_FALLBACK_DIST) { return undefined; }
     const fallbackFirst = Math.max(1, nearestLine - contextLines);
     const fallbackLast  = nearestLine + contextLines;
     for (let ln = fallbackFirst; ln <= fallbackLast; ln++) {
@@ -170,8 +217,9 @@ function extractDiffContext(
   }
 
   return {
-    code:         collected.map(l => l.code).join('\n'),
-    startLineNum: collected[0].ln,
+    code:          collected.map(l => l.code).join('\n'),
+    startLineNum:  collected[0].ln,
+    correctedLine: flagFirst,
   };
 }
 
@@ -182,10 +230,13 @@ function extractDiffContext(
 function attachDiffContext(comments: ReviewComment[], fileDiff: string): void {
   for (const c of comments) {
     if (c.line <= 0) { continue; }
-    const ctx = extractDiffContext(fileDiff, c.line, c.endLine);
+    const ctx = extractDiffContext(fileDiff, c.line, c.endLine, 2, c.codeFragment);
     if (ctx) {
-      c.codeContext         = ctx.code;
+      c.codeContext          = ctx.code;
       c.codeContextStartLine = ctx.startLineNum;
+      // FIX 3: update c.line to the fragment-corrected value so the card header
+      // and highlight both point to the actual offending line, not the AI-guessed one.
+      c.line = ctx.correctedLine;
     }
   }
 }
@@ -193,28 +244,39 @@ function attachDiffContext(comments: ReviewComment[], fileDiff: string): void {
 /**
  * Mutates each comment in `comments` to attach diff-sourced code context,
  * matching each comment to its file's diff section via filePath lookup.
- * This fixes the issue where comments reference files that aren't the first
- * section but get matched to fileSections[0] instead.
+ *
+ * Lookup order for each comment's c.file:
+ *   1. Exact path match  (e.g. "src/foo.c"  →  "src/foo.c")
+ *   2. Basename match    (e.g. "foo.c"       →  "src/foo.c")
+ *
+ * If neither matches, the comment is skipped — we never fall back to the
+ * combined multi-file diff.  Passing a combined diff to extractDiffContext
+ * collapses line numbers from all files into one shared namespace, so a
+ * "line 19" in file A can be silently overwritten by "line 19" in file B.
  */
 function attachDiffContextByFile(
   comments: ReviewComment[],
-  fileSections: Array<{ filePath: string; diff: string }>,
-  fallbackDiff: string
+  fileSections: Array<{ filePath: string; diff: string }>
 ): void {
-  // Build filePath -> diff map for O(1) lookup
-  const diffByFile = new Map<string, string>();
+  const diffByFile     = new Map<string, string>();
+  const diffByBasename = new Map<string, string>();
   for (const fs of fileSections) {
     diffByFile.set(fs.filePath, fs.diff);
+    diffByBasename.set(path.basename(fs.filePath), fs.diff);
   }
 
   for (const c of comments) {
     if (c.line <= 0) { continue; }
-    // Use this comment's file to look up the right diff
-    const fileDiff = diffByFile.get(c.file) ?? fallbackDiff;
-    const ctx = extractDiffContext(fileDiff, c.line, c.endLine);
+    // Resolve to exactly one file's diff — never the combined diff.
+    const fileDiff = diffByFile.get(c.file)
+      ?? diffByBasename.get(path.basename(c.file));
+    if (!fileDiff) { continue; }
+    const ctx = extractDiffContext(fileDiff, c.line, c.endLine, 2, c.codeFragment);
     if (ctx) {
-      c.codeContext         = ctx.code;
+      c.codeContext          = ctx.code;
       c.codeContextStartLine = ctx.startLineNum;
+      // FIX 3: update c.line to the fragment-corrected value (see attachDiffContext).
+      c.line = ctx.correctedLine;
     }
   }
 }
@@ -232,6 +294,8 @@ export interface ReviewResult {
   comments: ReviewComment[];
   conclusion: string;
   tests: ReviewTest[];
+  /** Suggested commit messages generated from the local diff. Empty for remote reviews. */
+  commitMessages: string[];
   sources?: ReviewSource[];
   profileUsed: string;
   modelUsed: string;
@@ -487,7 +551,8 @@ async function buildRepoContext(
 function buildSystemPrompt(
   profile: ReviewProfile,
   sources?: ReviewSource[],
-  repoContext?: string
+  repoContext?: string,
+  commitRules?: ReviewRule[]
 ): string {
   const enabledRules = profile.rules.filter(r => r.enabled);
 
@@ -528,6 +593,29 @@ function buildSystemPrompt(
 
   const repoContextSection = repoContext ?? '';
 
+  // Build optional commit message section (local single-file path only).
+  // commitRules come from the separate commit-style profile — never from the
+  // active domain profile — so domain rules and commit rules stay decoupled.
+  let commitMsgSection = '';
+  if (commitRules && commitRules.length > 0) {
+    const commitRuleLines = commitRules.map(r => {
+      const sug = r.suggestion ? ` → ${r.suggestion}` : '';
+      return `- [${r.id}] ${r.title}: ${r.description}${sug}`;
+    }).join('\n');
+    commitMsgSection = `
+## Commit Messages
+Generate 2-3 commit message suggestions for this diff in "commit_messages" array.
+Each suggestion covers the FULL diff as a single commit — they are alternative phrasings of the same commit, not a per-file or per-area split.
+Follow these rules exactly:
+${commitRuleLines}
+Each message must be a single string (subject line only, or subject + blank line + body).`;
+  }
+
+  // Extend JSON schema with commit_messages only when needed.
+  const commitMsgSchema = commitRules && commitRules.length > 0
+    ? `,"commit_messages":["<msg1>","<msg2>"]`
+    : '';
+
   return `You are a professional code reviewer specializing in ${profile.label}.${profile.system_prompt_extra ? '\n\n' + profile.system_prompt_extra.trim() : ''}
 
 ## Rules (${enabledRules.length} enabled)
@@ -536,11 +624,12 @@ ID | Severity | Title | Description
 ${rulesTable}
 
 ## Response Format (JSON only, no markdown fences)
-{"verdict":"APPROVE|REQUEST_CHANGES|NEEDS_DISCUSSION","score":1-10,"summary":"<overview>","comments":[{"file":"<file>","line":<N>,"endLine":<N>,"severity":"error|warning|suggestion","ruleId":"<ID>","ruleTitle":"<title>","message":"<120 chars>","suggestion":"<raw code, \\n joined>"}],"conclusion":"<summary>","tests":[{"title":"<Feature area — failure mode in plain English>","category":"functional|security|boundary|performance","steps":["<imperative action>","<imperative action>","<imperative verification with exact expected result>"]}]}
+{"verdict":"APPROVE|REQUEST_CHANGES|NEEDS_DISCUSSION","score":1-10,"summary":"<overview>","comments":[{"file":"<file>","line":<N>,"endLine":<N>,"severity":"error|warning|suggestion","ruleId":"<ID>","ruleTitle":"<title>","message":"<120 chars>","suggestion":"<raw code, \\n joined>","codeFragment":"<verbatim 1-3 lines from diff>"}],"conclusion":"<summary>","tests":[{"title":"<Feature area — failure mode in plain English>","category":"functional|security|boundary|performance","steps":["<imperative action>","<imperative action>","<imperative verification with exact expected result>"]}]${commitMsgSchema}}
 
 ## Rules
 - "message": single sentence <120 chars, no explanations
-- "line": exact offending line in diff; prefer first added/changed line
+- "line": line number of the exact expression, condition, or declaration that violates the rule — not the containing function header, not a surrounding brace; for an uninitialized variable, report the declaration line; for a Yoda condition, report the line with the comparison operator
+- "codeFragment": copy verbatim the specific line(s) that directly contain the rule violation — the statement, condition, or declaration that must be changed; never copy closing braces, blank lines, or lines that are only structural context; do not include the leading diff prefix character (+ or -)
 - "suggestion": raw code only, \\n joined, no fences, no prose; omit if no fix
 - Score harshly: 7-8=acceptable, 5-6=needs work, 3-4=significant issues, 1-2=major problems
 - No praise, focus on problems only
@@ -575,10 +664,26 @@ ${rulesTable}
   • Title format: "<Feature area> — <what could go wrong in plain English>".
   • Omit entirely if the diff is purely cosmetic (whitespace, comments, renames with no logic change).
   • Max 6 scenarios total, up to 2 per category. Fewer sharp tests beat many shallow ones.
-${ticketSection}${multiRepoSection}${repoContextSection ? '\n' + repoContextSection : ''}`;
+${ticketSection}${multiRepoSection}${repoContextSection ? '\n' + repoContextSection : ''}${commitMsgSection}`;
 }
 
-function buildUserPrompt(diff: string): string {
+function buildUserPrompt(diff: string, options?: { allInOne?: boolean }): string {
+  if (options?.allInOne) {
+    return `Review this multi-file code diff.
+
+CRITICAL INSTRUCTIONS:
+- Only review lines that were ADDED (prefix: +) or REMOVED (prefix: -)
+- DO NOT review context lines (lines without + or - prefix)
+- The diff contains multiple files separated by standard "diff --git" headers
+- For each finding, include the EXACT file path from the diff --git header (b/ side) in the "file" field
+- Focus ONLY on the actual changes made by the developer
+
+\`\`\`diff
+${diff}
+\`\`\`
+
+Remember: Review ONLY lines starting with + or -. Every finding MUST include the correct file path.`;
+  }
   return `Review this code diff.
 
 CRITICAL INSTRUCTIONS:
@@ -711,6 +816,7 @@ function parseReviewResponse(
       ruleTitle: c.ruleTitle,
       message: c.message || '',
       suggestion: c.suggestion,
+      codeFragment: typeof c.codeFragment === 'string' && c.codeFragment.trim() ? c.codeFragment.trim() : undefined,
     })),
     conclusion: parsed.conclusion || '',
     tests: sortTestsByCategory((parsed.tests || []).map((t: any): ReviewTest => ({
@@ -718,6 +824,11 @@ function parseReviewResponse(
       category: (['functional', 'security', 'boundary', 'performance'].includes(t.category) ? t.category : 'functional') as ReviewTest['category'],
       steps: Array.isArray(t.steps) ? t.steps.map((s: any) => String(s)) : [],
     }))),
+    commitMessages: Array.isArray(parsed.commit_messages)
+      ? parsed.commit_messages
+          .filter((m: any) => typeof m === 'string' && m.trim().length > 0)
+          .slice(0, 5)
+      : [],
     sources,
     profileUsed: profile.label,
     modelUsed: aiResp.model,
@@ -791,12 +902,70 @@ function averageScore(scores: number[]): number {
 // Main review function (public API — backwards compatible)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Lightweight dedicated AI call to generate commit message suggestions for a
+ * multi-file local diff.  Called once after the parallel per-file fan-out
+ * completes so the AI sees the full changeset context rather than individual
+ * file snippets.
+ *
+ * Input is intentionally compact (~400-500 tokens):
+ *   - List of changed files
+ *   - Key symbols extracted from the diff
+ *   - The merged review summary (already generated)
+ *   - Commit-style rules
+ */
+async function generateCommitMessages(
+  changedFiles: string[],
+  symbols: string[],
+  reviewSummary: string,
+  commitRules: ReviewRule[],
+  keys: AIKeys
+): Promise<string[]> {
+  const ruleLines = commitRules.map(r => {
+    const sug = r.suggestion ? ` → ${r.suggestion}` : '';
+    return `- [${r.id}] ${r.title}: ${r.description}${sug}`;
+  }).join('\n');
+
+  const systemPrompt =
+    `You are a commit message writer. Return ONLY valid JSON: {"commit_messages":["<msg1>","<msg2>","<msg3>"]}\n` +
+    `Follow these commit style rules:\n${ruleLines}`;
+
+  const fileList = changedFiles.slice(0, 20).join(', ');
+  const symbolList = symbols.slice(0, 10).join(', ');
+  const userPrompt =
+    `Generate 2-3 alternative commit messages for committing ALL of these changes together in ONE commit.\n` +
+    `Each suggestion must describe the ENTIRE changeset — not a single file or part of it.\n` +
+    `They are different phrasings of the same commit, not a split of changes across commits.\n` +
+    `Changed files: ${fileList}\n` +
+    (symbolList ? `Key symbols changed: ${symbolList}\n` : '') +
+    `Review summary: ${reviewSummary.slice(0, 300)}\n` +
+    `Return only the JSON object.`;
+
+  try {
+    const aiResp = await callAI(userPrompt, systemPrompt, keys);
+    const clean = aiResp.text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) { return []; }
+    const parsed = JSON.parse(jsonMatch[0]);
+    return Array.isArray(parsed.commit_messages)
+      ? parsed.commit_messages
+          .filter((m: any) => typeof m === 'string' && m.trim().length > 0)
+          .slice(0, 5)
+      : [];
+  } catch (e: any) {
+    console.log(`[Revvy] generateCommitMessages failed: ${e.message}`);
+    return [];
+  }
+}
+
 export async function runReview(
   diff: string,
   profile: ReviewProfile,
   sources?: ReviewSource[],
   keys: AIKeys = {},
-  onChunk?: StreamChunkCallback
+  onChunk?: StreamChunkCallback,
+  commitRules?: ReviewRule[],
+  mode: 'per_file' | 'all_in_one' = 'per_file'
 ): Promise<ReviewResult> {
   if (!diff.trim()) {
     throw new Error('No diff to review');
@@ -832,7 +1001,11 @@ export async function runReview(
   // each per-file call still carries the multi-repo header and integration guidance.
   // A multi-repo review with 4 repos × 3 files each = 12 parallel AI calls
   // instead of 1 sequential mega-call.
-  const useParallel = fileSections.length > 1;
+  //
+  // 'all_in_one' mode bypasses the fan-out entirely: the full combined diff is
+  // sent as a single AI request. Useful for small MRs where cross-file context
+  // matters more than parallelism.
+  const useParallel = mode !== 'all_in_one' && fileSections.length > 1;
 
   let merged: ReviewResult;
 
@@ -904,6 +1077,11 @@ export async function runReview(
       comments:    uniqueComments,
       conclusion:  perFileResults.map(r => r.conclusion).filter(Boolean).join(' '),
       tests:       sortTestsByCategory(uniqueTests),
+      // Commit messages are NOT generated per-file (each file only sees its own
+      // diff, producing file-scoped messages). Instead, generateCommitMessages()
+      // is called once below with full changeset context.  Remote reviews skip
+      // this entirely — commitMessages stays empty.
+      commitMessages: [],
       sources,
       profileUsed: profile.label,
       modelUsed:   lastResult.modelUsed,
@@ -918,9 +1096,30 @@ export async function runReview(
       estimatedInputTokens:  estimateTokens(totalInputChars),
       estimatedOutputTokens: estimateTokens(totalOutputChars),
     };
+
+    // One lightweight extra AI call to generate commit messages for the full
+    // changeset. Only for local reviews when commitRules are provided.
+    if (!isRemote && commitRules && commitRules.length > 0) {
+      const changedFiles = fileSections.map(s => s.filePath);
+      const allSymbols = fileSections.flatMap(s => extractChangedSymbols(s.diff));
+      const uniqueSymbols = [...new Set(allSymbols)];
+      merged.commitMessages = await generateCommitMessages(
+        changedFiles, uniqueSymbols, merged.summary, commitRules, keys
+      );
+    }
   } else {
-    const systemPrompt = buildSystemPrompt(profile, sources);
-    const userPrompt   = buildUserPrompt(filteredDiff);
+    const systemPrompt = buildSystemPrompt(
+      profile, sources, undefined,
+      // Pass commitRules only for local reviews (single-file or all-in-one) so the
+      // AI generates commit messages in the same call — zero extra round-trip cost.
+      !isRemote ? commitRules : undefined
+    );
+    // Use the multi-file all-in-one prompt when mode is 'all_in_one' and the diff
+    // spans more than one file — instructs the AI to attribute findings by file path.
+    const userPrompt = buildUserPrompt(
+      filteredDiff,
+      { allInOne: mode === 'all_in_one' && fileSections.length > 1 }
+    );
 
     const start = Date.now();
     const aiResp = await callAI(userPrompt, systemPrompt, keys, onChunk);
@@ -930,7 +1129,9 @@ export async function runReview(
     // For remote reviews, attach diff-sourced code context.
     // Use per-file diff matching so each comment gets its own file's diff.
     if (isRemote) {
-      attachDiffContextByFile(merged.comments, fileSections, filteredDiff);
+      attachDiffContextByFile(merged.comments, fileSections);
+      // Hard guard: never expose commit messages in remote reviews.
+      merged.commitMessages = [];
     }
     merged.filterStats = {
       keptFiles:           filterResult.keptFiles,
