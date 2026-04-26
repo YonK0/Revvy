@@ -55,6 +55,58 @@ Not quite. Revvy also:
 | Cost | Free & open-source | Included in your AI plan | Paid |
 ---
 
+## Review Modes
+
+Revvy offers two review modes you can toggle in the panel. Each is optimized for a different MR shape.
+
+### Per File mode (default)
+
+Each file is reviewed in its own AI request, in parallel. Use for **complex MRs** with many files or substantial changes.
+
+```mermaid
+flowchart LR
+    MR[Merge Request5 files modified]
+    MR --> S1[Split by file]
+    S1 --> F1[file1.cpp]
+    S1 --> F2[file2.h]
+    S1 --> F3[file3.cpp]
+    S1 --> F4[file4.h]
+    S1 --> F5[file5.cpp]
+    F1 --> AI1["AI request 1(1 premium request)"]
+    F2 --> AI2["AI request 2(1 premium request)"]
+    F3 --> AI3["AI request 3(1 premium request)"]
+    F4 --> AI4["AI request 4(1 premium request)"]
+    F5 --> AI5["AI request 5(1 premium request)"]
+    AI1 --> R["Merged reviewTotal: 5 requests"]
+    AI2 --> R
+    AI3 --> R
+    AI4 --> R
+    AI5 --> R
+```
+
+**What it solves:** focused attention per file, no context dilution, no output truncation. Each finding is reasoned about with the full attention budget of the model.
+
+**Cost:** higher — N requests for N files. Best quality on complex MRs.
+
+### All in One mode
+
+The entire MR is sent to the AI in a single request. Use for **small MRs** (under ~5 files / ~300 lines of diff).
+
+```mermaid
+flowchart LR
+    MR[Merge Request3 small files]
+    MR --> C[Combined diff]
+    C --> AI["Single AI request(1 premium request)"]
+    AI --> R["ReviewTotal: 1 request"]
+```
+
+**What it solves:** lower quota consumption when the MR is small enough that focused per-file attention isn't necessary. Useful for small fixes, opcode additions, or single-feature changes.
+
+**Cost:** 1 request total. May miss findings on larger MRs.
+
+> Use **All in One** for small MRs (under ~5 files / ~300 lines of diff).
+> Use **Per File** for larger or complex MRs.
+
 ## Demo
 
 <img width="800" height="450" alt="revvy" src="https://github.com/user-attachments/assets/d34de152-fd9d-40a2-99f6-a3a13ff04b29" />
@@ -135,6 +187,18 @@ Enables Jira ticket fetching and multi-repo PR/MR review. Copy `.vscode/mcp.json
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    User["👤 User"] --> Trigger["Trigger review(local diff or remote MR)"]
+
+    Trigger --> Engine["Revvy engine"]
+    Rules["📄 YAML rules"] -.-> Engine
+
+    Engine --> AI["AI backendCopilot · OpenAI · Anthropic"]
+
+    AI --> Out["Findings in VS Code"]
+```
+# Code Architecture
 ```
 src/
 ├── extension.ts      # Entry point — commands, WebView provider, YAML watcher
