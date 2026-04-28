@@ -12,6 +12,10 @@ import { runReview, autoDetectProfile, ReviewSource } from './reviewer';
 import { AIKeys } from './aiBackend';
 import { ReviewPanelProvider } from './panelProvider';
 import { normalizeGitLabDiffResponse, normalizeRemoteDiff } from './diffFilter';
+import { Credentials } from './http/credentials';
+import { GitLabClient } from './http/gitlabClient';
+import { GitHubClient } from './http/githubClient';
+import { JiraClient } from './http/jiraClient';
 
 const execAsync = promisify(exec);
 
@@ -19,12 +23,24 @@ let ruleLoader: RuleLoader | undefined;
 let panelProvider: ReviewPanelProvider;
 let extensionContext: vscode.ExtensionContext;
 
+// Direct HTTP clients — initialised in activate(), used when useDirectHttp=true
+let credentials:       Credentials;
+let gitlabHttpClient:  GitLabClient;
+let githubHttpClient:  GitHubClient;
+let jiraHttpClient:    JiraClient;
+
 /** In-memory requirements — never written to YAML on disk. */
 let activeRequirements: { profileId: string; text: string } | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
   console.log('Revvy activated');
   extensionContext = context;
+
+  // ── STEP 0: Initialise direct-HTTP clients ────────────────────────────────
+  credentials      = new Credentials(context);
+  gitlabHttpClient = new GitLabClient(credentials);
+  githubHttpClient = new GitHubClient(credentials);
+  jiraHttpClient   = new JiraClient(credentials);
 
   // ── STEP 1: Register the webview provider IMMEDIATELY ─────────────────────
   // This MUST happen before any async/throwing work so VS Code can resolve
@@ -132,6 +148,34 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('revvy.goHome', () => {
       const label = activeRequirements ? buildRequirementsLabel(activeRequirements.text) : '';
       panelProvider.showWelcome(!!activeRequirements, label);
+    })
+  );
+
+  // ── Credential-management commands (direct HTTP) ──────────────────────────
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.resetGitlabCredentials', async () => {
+      await credentials.clear('gitlab');
+      vscode.window.showInformationMessage('GitLab credentials cleared.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.resetGithubCredentials', async () => {
+      await credentials.clear('github');
+      vscode.window.showInformationMessage('GitHub credentials cleared.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.resetJiraCredentials', async () => {
+      await credentials.clear('jira');
+      vscode.window.showInformationMessage('Jira credentials cleared.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.openConfigure', async () => {
+      await panelProvider.showConfigure();
     })
   );
 
@@ -680,6 +724,65 @@ function extractTextFromToolResult(result: any): string {
 }
 
 /**
+ * Fetches the diff for a single PR/MR.
+ *
+ * When `revvy.network.useDirectHttp` is true (default), calls the appropriate
+ * platform's REST API directly — no MCP server required. If the setting is
+ * false, falls back to the MCP path instead.
+ *
+ * On any error the message is surfaced via showErrorMessage and null is
+ * returned so the caller's per-ref failure tracking still works.
+ */
+async function fetchMrDiff(ref: MrRef): Promise<string | null> {
+  const useDirectHttp = vscode.workspace
+    .getConfiguration('revvy.network')
+    .get<boolean>('useDirectHttp', true);
+
+  if (!useDirectHttp) {
+    return fetchMrDiffViaMcp(ref);
+  }
+
+  try {
+    if (ref.type === 'gitlab') {
+      const projectId = ref.owner ? `${ref.owner}/${ref.repo}` : ref.repo;
+      const diffs = await gitlabHttpClient.fetchDiffs(projectId, ref.number);
+      return normalizeGitLabDiffResponse(JSON.stringify(diffs));
+    }
+
+    if (ref.type === 'github') {
+      return await githubHttpClient.fetchDiff(ref.owner, ref.repo, ref.number);
+    }
+
+    return null;
+  } catch (err: any) {
+    console.log(`[Revvy] Direct HTTP fetch failed for ${ref.display}: ${err.message}`);
+    vscode.window.showErrorMessage(`Revvy: Failed to fetch diff for ${ref.display} — ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Fetches a Jira ticket via direct HTTP and formats it as structured markdown.
+ * Returns null (and shows an error) on any failure.
+ */
+async function fetchJiraTicketDirect(ticketId: string): Promise<string | null> {
+  try {
+    const ticket = await jiraHttpClient.fetchTicket(ticketId);
+    return [
+      `Summary: ${ticket.summary}`,
+      `Status: ${ticket.status}`,
+      '',
+      'Description:',
+      ticket.description || '(no description)',
+    ].join('\n');
+  } catch (err: any) {
+    console.log(`[Revvy] Direct HTTP Jira fetch failed for ${ticketId}: ${err.message}`);
+    vscode.window.showErrorMessage(`Revvy: Failed to fetch ${ticketId} from Jira — ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Fetches the diff for a single PR/MR via the appropriate MCP tool.
  * Tries multiple tool names and input key variants to handle different
  * @modelcontextprotocol/server-github and server-gitlab versions.
@@ -869,7 +972,7 @@ async function reviewMultiMR() {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Multi-repo review: fetching ${refs.length} MR/PR diff(s) via MCP…`,
+      title: `Multi-repo review: fetching ${refs.length} MR/PR diff(s)…`,
       cancellable: false,
     },
     async progress => {
@@ -880,7 +983,7 @@ async function reviewMultiMR() {
 
       const fetchResults = await Promise.all(
         refs.map(async (ref) => {
-          const diff = await fetchMrDiffViaMcp(ref);
+          const diff = await fetchMrDiff(ref);
           return { ref, diff };
         })
       );
@@ -910,8 +1013,11 @@ async function reviewMultiMR() {
 
       if (failed.length > 0) {
         const hostTypes = [...new Set(refs.filter(r => failed.includes(r.display)).map(r => r.type === 'gitlab' ? 'GitLab' : 'GitHub'))];
-        const msg = `Could not fetch diff via MCP for: ${failed.join(', ')}. ` +
-          `Ensure the ${hostTypes.join(' / ')} MCP server is running (.vscode/mcp.json).`;
+        const useDirectHttp = vscode.workspace.getConfiguration('revvy.network').get<boolean>('useDirectHttp', true);
+        const hint = useDirectHttp
+          ? `Check that revvy.${hostTypes.map(h => h.toLowerCase()).join('/')} .baseUrl is configured and credentials are set.`
+          : `Ensure the ${hostTypes.join(' / ')} MCP server is running (.vscode/mcp.json).`;
+        const msg = `Could not fetch diff for: ${failed.join(', ')}. ${hint}`;
         if (diffs.length === 0) { vscode.window.showErrorMessage(msg); return; }
         vscode.window.showWarningMessage(msg);
       }
@@ -1086,45 +1192,61 @@ async function setTicketRequirements() {
 
   let requirementText = input.trim();
 
-  // ── Jira auto-fetch via MCP ──────────────────────────────────────────────
+  // ── Jira auto-fetch ───────────────────────────────────────────────────────
   const jiraId = detectJiraId(input);
   if (jiraId) {
+    const useDirectHttp = vscode.workspace
+      .getConfiguration('revvy.network')
+      .get<boolean>('useDirectHttp', true);
+
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: `Fetching ${jiraId} from Jira via MCP…`,
+        title: `Fetching ${jiraId} from Jira…`,
         cancellable: false,
       },
       async () => {
-        const { text: fetched, errors: fetchErrors } = await fetchJiraTicketViaMcp(jiraId);
-        if (fetched) {
-          requirementText = `Jira Ticket: ${jiraId}\n\n${fetched}`;
-          vscode.window.showInformationMessage(`✅ Fetched ${jiraId} from Jira via MCP`);
+        if (useDirectHttp) {
+          // ── Direct HTTP path ────────────────────────────────────────────
+          const fetched = await fetchJiraTicketDirect(jiraId);
+          if (fetched) {
+            requirementText = `Jira Ticket: ${jiraId}\n\n${fetched}`;
+            vscode.window.showInformationMessage(`Fetched ${jiraId} from Jira`);
+          }
+          // On failure fetchJiraTicketDirect already showed an error message;
+          // requirementText keeps its value (the raw jiraId string) as a reference.
         } else {
-          // MCP not available or Atlassian server not running — store the ID as a reference
-          requirementText =
-            `Jira Ticket ID: ${jiraId}\n` +
-            `(Auto-fetch unavailable. Configure the Atlassian MCP server in .vscode/mcp.json ` +
-            `and set revvy.jiraBaseUrl / revvy.jiraEmail in settings.)`;
+          // ── MCP path (legacy / opt-in) ──────────────────────────────────
+          const { text: fetched, errors: fetchErrors } = await fetchJiraTicketViaMcp(jiraId);
+          if (fetched) {
+            requirementText = `Jira Ticket: ${jiraId}\n\n${fetched}`;
+            vscode.window.showInformationMessage(`✅ Fetched ${jiraId} from Jira via MCP`);
+          } else {
+            // MCP not available or Atlassian server not running — store the ID as a reference
+            requirementText =
+              `Jira Ticket ID: ${jiraId}\n` +
+              `(Auto-fetch unavailable. Configure the Atlassian MCP server in .vscode/mcp.json ` +
+              `and set revvy.jiraBaseUrl / revvy.jiraEmail in settings.)`;
 
-          const errorDetail = fetchErrors.length > 0
-            ? ` Errors: ${fetchErrors.slice(0, 2).join('; ')}`
-            : '';
-          const sel = await vscode.window.showWarningMessage(
-            `Jira MCP tool not reachable. Stored "${jiraId}" as reference.${errorDetail}`,
-            'Open .vscode/mcp.json',
-            'MCP Atlassian Docs'
-          );
-          if (sel === 'Open .vscode/mcp.json') {
-            const mcpUri = vscode.Uri.joinPath(
-              vscode.workspace.workspaceFolders![0].uri,
-              '.vscode', 'mcp.json'
+            const errorDetail = fetchErrors.length > 0
+              ? ` Errors: ${fetchErrors.slice(0, 2).join('; ')}`
+              : '';
+            const sel = await vscode.window.showWarningMessage(
+              `Jira MCP tool not reachable. Stored "${jiraId}" as reference.${errorDetail}`,
+              'Open .vscode/mcp.json',
+              'MCP Atlassian Docs'
             );
-            vscode.window.showTextDocument(mcpUri);
-          } else if (sel === 'MCP Atlassian Docs') {
-            vscode.env.openExternal(
-              vscode.Uri.parse('https://github.com/sooperset/mcp-atlassian')
-            );
+            if (sel === 'Open .vscode/mcp.json') {
+              const mcpUri = vscode.Uri.joinPath(
+                vscode.workspace.workspaceFolders![0].uri,
+                '.vscode', 'mcp.json'
+              );
+              vscode.window.showTextDocument(mcpUri);
+            } else if (sel === 'MCP Atlassian Docs') {
+              vscode.env.openExternal(
+                vscode.Uri.parse('https://github.com/sooperset/mcp-atlassian')
+              );
+            }
           }
         }
       }

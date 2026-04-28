@@ -75,6 +75,80 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
           webviewView.webview.postMessage({ type: 'reviewMode', mode: savedMode });
           break;
         }
+
+        // ── Configuration screen ──────────────────────────────────────────────
+        case 'openConfigure':
+          await this.showConfigure();
+          break;
+
+        case 'saveGitlabUrl':
+          await vscode.workspace.getConfiguration('revvy.gitlab')
+            .update('baseUrl', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'gitlab-url' });
+          break;
+
+        case 'saveGitlabApiVer':
+          await vscode.workspace.getConfiguration('revvy.gitlab')
+            .update('apiVersion', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'gitlab-api-ver' });
+          break;
+
+        case 'saveGitlabToken':
+          if (msg.value) {
+            await this.context.secrets.store('revvy.gitlab.token', msg.value);
+            webviewView.webview.postMessage({ type: 'saveAck', field: 'gitlab-token' });
+          }
+          break;
+
+        case 'saveGithubUrl':
+          await vscode.workspace.getConfiguration('revvy.github')
+            .update('baseUrl', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'github-url' });
+          break;
+
+        case 'saveGithubToken':
+          if (msg.value) {
+            await this.context.secrets.store('revvy.github.token', msg.value);
+            webviewView.webview.postMessage({ type: 'saveAck', field: 'github-token' });
+          }
+          break;
+
+        case 'saveJiraUrl':
+          await vscode.workspace.getConfiguration('revvy.jira')
+            .update('baseUrl', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'jira-url' });
+          break;
+
+        case 'saveJiraApiVer':
+          await vscode.workspace.getConfiguration('revvy.jira')
+            .update('apiVersion', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'jira-api-ver' });
+          break;
+
+        case 'saveJiraUser':
+          if (msg.value) {
+            await this.context.secrets.store('revvy.jira.user', msg.value);
+            webviewView.webview.postMessage({ type: 'saveAck', field: 'jira-user' });
+          }
+          break;
+
+        case 'saveJiraToken':
+          if (msg.value) {
+            await this.context.secrets.store('revvy.jira.token', msg.value);
+            webviewView.webview.postMessage({ type: 'saveAck', field: 'jira-token' });
+          }
+          break;
+
+        case 'saveNoProxy': {
+          const hosts = (msg.value as string)
+            .split(',')
+            .map((h: string) => h.trim())
+            .filter((h: string) => h.length > 0);
+          await vscode.workspace.getConfiguration('revvy.network')
+            .update('noProxy', hosts, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'noproxy-hosts' });
+          break;
+        }
       }
     });
   }
@@ -550,6 +624,357 @@ body {
     }
   }
 
+  // ──────────────────────────────────────────────────────────
+  // Configuration Screen
+  // ──────────────────────────────────────────────────────────
+
+  public async showConfigure() {
+    if (!this._view) { return; }
+    // Read current base URLs from VS Code config (sync)
+    const gitlabUrl    = vscode.workspace.getConfiguration('revvy.gitlab').get<string>('baseUrl', '');
+    const gitlabApiVer = vscode.workspace.getConfiguration('revvy.gitlab').get<string>('apiVersion', 'v4');
+    const githubUrl    = vscode.workspace.getConfiguration('revvy.github').get<string>('baseUrl', 'https://api.github.com');
+    const jiraUrl      = vscode.workspace.getConfiguration('revvy.jira').get<string>('baseUrl', '');
+    const jiraApiVer   = vscode.workspace.getConfiguration('revvy.jira').get<string>('apiVersion', '2');
+    const noProxyArr   = vscode.workspace.getConfiguration('revvy.network').get<string[]>('noProxy', []);
+    const noProxy      = noProxyArr.join(', ');
+    // Check secret existence (bool only — values never leave SecretStorage)
+    const hasGitlabToken = !!(await this.context.secrets.get('revvy.gitlab.token'));
+    const hasGithubToken = !!(await this.context.secrets.get('revvy.github.token'));
+    const hasJiraUser    = !!(await this.context.secrets.get('revvy.jira.user'));
+    const hasJiraToken   = !!(await this.context.secrets.get('revvy.jira.token'));
+    this._view.webview.html = this.getConfigureHtml({
+      gitlabUrl, gitlabApiVer, githubUrl, jiraUrl, jiraApiVer, noProxy,
+      hasGitlabToken, hasGithubToken, hasJiraUser, hasJiraToken,
+    });
+  }
+
+  private getConfigureHtml(cfg: {
+    gitlabUrl: string;
+    gitlabApiVer: string;
+    githubUrl: string;
+    jiraUrl: string;
+    jiraApiVer: string;
+    noProxy: string;
+    hasGitlabToken: boolean;
+    hasGithubToken: boolean;
+    hasJiraUser: boolean;
+    hasJiraToken: boolean;
+  }): string {
+    const e = (s: string) => this.escapeHtml(s);
+    const tokenPlaceholder = (has: boolean, hint: string) =>
+      has ? 'Already saved — enter to replace' : hint;
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  ${this.getSharedCss()}
+
+  /* ── Configure-screen extras ── */
+  .cfg-page { display:flex; flex-direction:column; min-height:100vh; }
+
+  .cfg-header {
+    display:flex; align-items:center; gap:10px;
+    padding:14px 16px 12px;
+    border-bottom:1px solid var(--border-muted);
+    background:var(--bg-overlay);
+    position:sticky; top:0; z-index:10;
+  }
+  .cfg-back-btn {
+    display:flex; align-items:center; justify-content:center;
+    width:28px; height:28px; padding:0;
+    background:transparent; border:1px solid var(--border-default);
+    border-radius:6px; cursor:pointer; color:var(--fg-muted);
+    flex-shrink:0;
+    transition:background 0.12s, color 0.12s;
+  }
+  .cfg-back-btn:hover { background:var(--bg-subtle); color:var(--fg-default); }
+  .cfg-back-btn svg { width:14px; height:14px; stroke:currentColor; fill:none; stroke-width:2.5; stroke-linecap:round; stroke-linejoin:round; }
+  .cfg-title { font-size:13px; font-weight:700; color:var(--fg-default); letter-spacing:-0.01em; }
+
+  /* ── Cards ── */
+  .cfg-body { padding:14px 14px 24px; display:flex; flex-direction:column; gap:14px; }
+  .cfg-card {
+    background:var(--bg-overlay);
+    border:1px solid var(--border-default);
+    border-radius:8px;
+    overflow:hidden;
+  }
+  .cfg-card-header {
+    display:flex; align-items:center; gap:9px;
+    padding:10px 14px;
+    background:var(--bg-subtle);
+    border-bottom:1px solid var(--border-muted);
+    font-size:12px; font-weight:700; color:var(--fg-default);
+    letter-spacing:0.01em;
+  }
+  .cfg-card-header svg { width:16px; height:16px; flex-shrink:0; }
+
+  /* ── Fields ── */
+  .cfg-fields { padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
+  .cfg-field { display:flex; flex-direction:column; gap:4px; }
+  .cfg-label {
+    font-size:11px; font-weight:600; color:var(--fg-subtle);
+    text-transform:uppercase; letter-spacing:0.06em;
+  }
+  .cfg-input-row { display:flex; align-items:center; gap:6px; }
+  .cfg-input {
+    flex:1;
+    background:var(--bg-subtle);
+    color:var(--fg-default);
+    border:1px solid var(--border-default);
+    border-radius:6px;
+    padding:7px 10px;
+    font-size:12px;
+    font-family:var(--font-sans);
+    transition:border-color 0.12s, box-shadow 0.12s;
+  }
+  .cfg-input::placeholder { color:var(--fg-subtle); opacity:0.8; }
+  .cfg-input:focus { outline:none; border-color:var(--accent-fg); box-shadow:0 0 0 3px rgba(88,166,255,0.15); }
+  .cfg-select {
+    flex:1;
+    background:var(--bg-subtle);
+    color:var(--fg-default);
+    border:1px solid var(--border-default);
+    border-radius:6px;
+    padding:7px 10px;
+    font-size:12px;
+    font-family:var(--font-sans);
+    appearance:none; -webkit-appearance:none;
+    cursor:pointer;
+    transition:border-color 0.12s;
+  }
+  .cfg-select:focus { outline:none; border-color:var(--accent-fg); box-shadow:0 0 0 3px rgba(88,166,255,0.15); }
+  .cfg-hint { font-size:10px; color:var(--fg-subtle); line-height:1.4; margin-top:1px; }
+
+  /* ── Inline "Saved" ack badge ── */
+  .cfg-ack {
+    font-size:10px; font-weight:600; color:var(--verdict-approve);
+    opacity:0; transition:opacity 0.2s;
+    white-space:nowrap; flex-shrink:0;
+  }
+</style>
+</head>
+<body>
+<div class="cfg-page">
+
+  <!-- ── Header ── -->
+  <div class="cfg-header">
+    <button class="cfg-back-btn" onclick="vscode.postMessage({type:'goHome'})" title="Back to home">
+      <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+    </button>
+    <span class="cfg-title">Configuration</span>
+  </div>
+
+  <div class="cfg-body">
+
+    <!-- ── GitLab ── -->
+    <div class="cfg-card">
+      <div class="cfg-card-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22.65 14.39L12 22.13 1.35 14.39a.84.84 0 0 1-.3-.94l1.22-3.78 2.44-7.51A.42.42 0 0 1 4.82 2a.43.43 0 0 1 .58 0 .42.42 0 0 1 .11.18l2.44 7.49h8.1l2.44-7.51a.42.42 0 0 1 .11-.18.43.43 0 0 1 .58 0 .42.42 0 0 1 .11.18l2.44 7.51L23 13.45a.84.84 0 0 1-.35.94z"/>
+        </svg>
+        GitLab
+      </div>
+      <div class="cfg-fields">
+        <div class="cfg-field">
+          <label class="cfg-label">Base URL</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="gitlab-url" type="url"
+              value="${e(cfg.gitlabUrl)}"
+              placeholder="https://gitlab.example.com" />
+            <span class="cfg-ack" id="gitlab-url-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Leave empty to use MCP path instead</span>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">API Version</label>
+          <div class="cfg-input-row">
+            <select class="cfg-select" id="gitlab-api-ver">
+              <option value="v4"${cfg.gitlabApiVer === 'v4' ? ' selected' : ''}>v4 (default)</option>
+              <option value="v3"${cfg.gitlabApiVer === 'v3' ? ' selected' : ''}>v3 (legacy)</option>
+            </select>
+            <span class="cfg-ack" id="gitlab-api-ver-ack">Saved</span>
+          </div>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">Personal Access Token</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="gitlab-token" type="password"
+              placeholder="${tokenPlaceholder(cfg.hasGitlabToken, 'Enter personal access token')}" />
+            <span class="cfg-ack" id="gitlab-token-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Needs <code>api</code> + <code>read_user</code> scopes</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── GitHub ── -->
+    <div class="cfg-card">
+      <div class="cfg-card-header">
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2z"/>
+        </svg>
+        GitHub
+      </div>
+      <div class="cfg-fields">
+        <div class="cfg-field">
+          <label class="cfg-label">Base URL</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="github-url" type="url"
+              value="${e(cfg.githubUrl)}"
+              placeholder="https://api.github.com" />
+            <span class="cfg-ack" id="github-url-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Override only for GitHub Enterprise Server</span>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">Personal Access Token</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="github-token" type="password"
+              placeholder="${tokenPlaceholder(cfg.hasGithubToken, 'Enter personal access token')}" />
+            <span class="cfg-ack" id="github-token-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Needs <code>repo</code> scope (or <code>read:org</code> for org repos)</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Jira ── -->
+    <div class="cfg-card">
+      <div class="cfg-card-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11.75 2.25 6 8l5.75 5.75L6 19.75"/>
+          <path d="M18 2.25 12.25 8 18 13.75l-5.75 5.75" opacity=".45"/>
+        </svg>
+        Jira
+      </div>
+      <div class="cfg-fields">
+        <div class="cfg-field">
+          <label class="cfg-label">Base URL</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="jira-url" type="url"
+              value="${e(cfg.jiraUrl)}"
+              placeholder="https://jira.example.com" />
+            <span class="cfg-ack" id="jira-url-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Leave empty to use MCP path instead</span>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">API Version</label>
+          <div class="cfg-input-row">
+            <select class="cfg-select" id="jira-api-ver">
+              <option value="2"${cfg.jiraApiVer === '2' ? ' selected' : ''}>v2 — Server / Data Center</option>
+              <option value="3"${cfg.jiraApiVer === '3' ? ' selected' : ''}>v3 — Cloud</option>
+            </select>
+            <span class="cfg-ack" id="jira-api-ver-ack">Saved</span>
+          </div>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">Username</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="jira-user" type="text"
+              placeholder="${tokenPlaceholder(cfg.hasJiraUser, 'Enter Jira username or email')}" />
+            <span class="cfg-ack" id="jira-user-ack">Saved</span>
+          </div>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">API Token / Password</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="jira-token" type="password"
+              placeholder="${tokenPlaceholder(cfg.hasJiraToken, 'Enter API token or password')}" />
+            <span class="cfg-ack" id="jira-token-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Use an API token for Jira Cloud; password for Server/DC</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Network ── -->
+    <div class="cfg-card">
+      <div class="cfg-card-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="2" y1="12" x2="22" y2="12"/>
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+        </svg>
+        Network
+      </div>
+      <div class="cfg-fields">
+        <div class="cfg-field">
+          <label class="cfg-label">Proxy Bypass Hosts</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="noproxy-hosts" type="text"
+              value="${e(cfg.noProxy)}"
+              placeholder="gitlab.corp.example.com, jira.corp.example.com" />
+            <span class="cfg-ack" id="noproxy-hosts-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Comma-separated hostnames that bypass the system proxy for direct HTTP calls</span>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /cfg-body -->
+
+<script>
+  const vscode = acquireVsCodeApi();
+
+  // Flash the "Saved" ack label next to a field
+  function showAck(fieldId) {
+    const el = document.getElementById(fieldId + '-ack');
+    if (!el) { return; }
+    el.style.opacity = '1';
+    setTimeout(function() { el.style.opacity = '0'; }, 1500);
+  }
+
+  // Listen for saveAck messages from the extension host
+  window.addEventListener('message', function(e) {
+    const msg = e.data;
+    if (msg.type === 'saveAck') { showAck(msg.field); }
+  });
+
+  // Auto-save text/url/password inputs on blur (only when value changed)
+  function watchBlur(id, msgType) {
+    const el = document.getElementById(id);
+    if (!el) { return; }
+    const original = el.value;
+    let lastSent = original;
+    el.addEventListener('blur', function() {
+      const v = el.value; // do NOT trim passwords
+      if (v !== lastSent) {
+        lastSent = v;
+        vscode.postMessage({ type: msgType, value: v });
+      }
+    });
+  }
+
+  // Auto-save select inputs on change immediately
+  function watchChange(id, msgType) {
+    const el = document.getElementById(id);
+    if (!el) { return; }
+    el.addEventListener('change', function() {
+      vscode.postMessage({ type: msgType, value: el.value });
+    });
+  }
+
+  watchBlur('gitlab-url',   'saveGitlabUrl');
+  watchBlur('gitlab-token', 'saveGitlabToken');
+  watchBlur('github-url',   'saveGithubUrl');
+  watchBlur('github-token', 'saveGithubToken');
+  watchBlur('jira-url',     'saveJiraUrl');
+  watchBlur('jira-user',    'saveJiraUser');
+  watchBlur('jira-token',   'saveJiraToken');
+  watchBlur('noproxy-hosts','saveNoProxy');
+
+  watchChange('gitlab-api-ver', 'saveGitlabApiVer');
+  watchChange('jira-api-ver',   'saveJiraApiVer');
+</script>
+</body>
+</html>`;
+  }
+
   private getWelcomeHtml(
     webview: vscode.Webview,
     requirementsActive = false,
@@ -718,6 +1143,10 @@ body {
         <button class="btn-secondary" onclick="vscode.postMessage({type:'reviewMultiMR'})">
           ${this.icons.repoForked}<span>Review Remote MRs</span>
           <span class="label-right">MCP</span>
+        </button>
+        <button class="btn-secondary" onclick="vscode.postMessage({type:'openConfigure'})" style="margin-top:4px;border-color:var(--border-default)">
+          ${this.icons.settings}<span>Configuration</span>
+          <span class="label-right">integrations</span>
         </button>
       </div>
 
