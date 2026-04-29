@@ -50,7 +50,11 @@
     "onCommand:revvy.reviewMultiMR",
     "onCommand:revvy.setOpenAIKey",
     "onCommand:revvy.setAnthropicKey",
-    "onCommand:revvy.goHome"
+    "onCommand:revvy.goHome",
+    "onCommand:revvy.resetGitlabCredentials",
+    "onCommand:revvy.resetGithubCredentials",
+    "onCommand:revvy.resetJiraCredentials",
+    "onCommand:revvy.openConfigure"
   ],
   "main": "./out/extension.js",
   "icon": "resources/icon.png",
@@ -112,6 +116,22 @@
       {
         "command": "revvy.goHome",
         "title": "Revvy: Go Home"
+      },
+      {
+        "command": "revvy.resetGitlabCredentials",
+        "title": "Revvy: Reset GitLab Credentials"
+      },
+      {
+        "command": "revvy.resetGithubCredentials",
+        "title": "Revvy: Reset GitHub Credentials"
+      },
+      {
+        "command": "revvy.resetJiraCredentials",
+        "title": "Revvy: Reset Jira Credentials"
+      },
+      {
+        "command": "revvy.openConfigure",
+        "title": "Revvy: Open Configuration"
       }
     ],
     "viewsContainers": {
@@ -163,17 +183,64 @@
         "revvy.jiraBaseUrl": {
           "type": "string",
           "default": "",
-          "description": "Jira base URL (e.g. https://yourcompany.atlassian.net) — used by the Atlassian MCP server"
+          "description": "Jira base URL for the Atlassian MCP server (deprecated — use revvy.jira.baseUrl for direct HTTP)"
         },
         "revvy.jiraEmail": {
           "type": "string",
           "default": "",
-          "description": "Jira account email — used by the Atlassian MCP server"
+          "description": "Jira account email for the Atlassian MCP server (deprecated — credentials are now stored securely via Revvy: Reset Jira Credentials)"
         },
         "revvy.gitlabUrl": {
           "type": "string",
           "default": "https://gitlab.com",
-          "description": "GitLab base URL — used by the GitLab MCP server for multi-repo review"
+          "description": "GitLab base URL for the GitLab MCP server (deprecated — use revvy.gitlab.baseUrl for direct HTTP)"
+        },
+        "revvy.gitlab.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "GitLab instance URL for direct HTTP access, e.g. https://gitlab.example.com"
+        },
+        "revvy.gitlab.apiVersion": {
+          "type": "string",
+          "default": "v4",
+          "description": "GitLab REST API version (default: v4)"
+        },
+        "revvy.github.baseUrl": {
+          "type": "string",
+          "default": "https://api.github.com",
+          "description": "GitHub API URL — override for GitHub Enterprise, e.g. https://github.example.com/api/v3"
+        },
+        "revvy.jira.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Jira instance URL for direct HTTP access, e.g. https://jira.example.com"
+        },
+        "revvy.jira.apiVersion": {
+          "type": "string",
+          "enum": [
+            "2",
+            "3"
+          ],
+          "default": "2",
+          "description": "Jira REST API version (2 for Server/Data Center, 3 for Cloud)"
+        },
+        "revvy.network.noProxy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Hostnames to bypass the system proxy for direct HTTP calls (e.g. internal GitLab/Jira hosts)"
+        },
+        "revvy.network.useDirectHttp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use direct HTTP for GitLab/GitHub/Jira instead of MCP servers (requires baseUrl settings to be configured)"
+        },
+        "revvy.network.allowInsecureTls": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip TLS certificate verification for proxy-bypassed hosts. Enable if the server uses a self-signed or corporate CA certificate and you get CERT errors."
         }
       }
     },

@@ -149,6 +149,12 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
           webviewView.webview.postMessage({ type: 'saveAck', field: 'noproxy-hosts' });
           break;
         }
+
+        case 'saveAllowInsecureTls':
+          await vscode.workspace.getConfiguration('revvy.network')
+            .update('allowInsecureTls', !!msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'allow-insecure-tls' });
+          break;
       }
     });
   }
@@ -636,15 +642,16 @@ body {
     const githubUrl    = vscode.workspace.getConfiguration('revvy.github').get<string>('baseUrl', 'https://api.github.com');
     const jiraUrl      = vscode.workspace.getConfiguration('revvy.jira').get<string>('baseUrl', '');
     const jiraApiVer   = vscode.workspace.getConfiguration('revvy.jira').get<string>('apiVersion', '2');
-    const noProxyArr   = vscode.workspace.getConfiguration('revvy.network').get<string[]>('noProxy', []);
-    const noProxy      = noProxyArr.join(', ');
+    const noProxyArr        = vscode.workspace.getConfiguration('revvy.network').get<string[]>('noProxy', []);
+    const noProxy           = noProxyArr.join(', ');
+    const allowInsecureTls  = vscode.workspace.getConfiguration('revvy.network').get<boolean>('allowInsecureTls', false);
     // Check secret existence (bool only — values never leave SecretStorage)
     const hasGitlabToken = !!(await this.context.secrets.get('revvy.gitlab.token'));
     const hasGithubToken = !!(await this.context.secrets.get('revvy.github.token'));
     const hasJiraUser    = !!(await this.context.secrets.get('revvy.jira.user'));
     const hasJiraToken   = !!(await this.context.secrets.get('revvy.jira.token'));
     this._view.webview.html = this.getConfigureHtml({
-      gitlabUrl, gitlabApiVer, githubUrl, jiraUrl, jiraApiVer, noProxy,
+      gitlabUrl, gitlabApiVer, githubUrl, jiraUrl, jiraApiVer, noProxy, allowInsecureTls,
       hasGitlabToken, hasGithubToken, hasJiraUser, hasJiraToken,
     });
   }
@@ -656,6 +663,7 @@ body {
     jiraUrl: string;
     jiraApiVer: string;
     noProxy: string;
+    allowInsecureTls: boolean;
     hasGitlabToken: boolean;
     hasGithubToken: boolean;
     hasJiraUser: boolean;
@@ -748,6 +756,7 @@ body {
   }
   .cfg-select:focus { outline:none; border-color:var(--accent-fg); box-shadow:0 0 0 3px rgba(88,166,255,0.15); }
   .cfg-hint { font-size:10px; color:var(--fg-subtle); line-height:1.4; margin-top:1px; }
+  .cfg-checkbox-label { display:flex; align-items:center; gap:6px; cursor:pointer; text-transform:none; letter-spacing:normal; font-weight:500; }
 
   /* ── Inline "Saved" ack badge ── */
   .cfg-ack {
@@ -787,7 +796,7 @@ body {
               placeholder="https://gitlab.example.com" />
             <span class="cfg-ack" id="gitlab-url-ack">Saved</span>
           </div>
-          <span class="cfg-hint">Leave empty to use MCP path instead</span>
+          <!-- <span class="cfg-hint">Leave empty to use MCP path instead</span> -->
         </div>
         <div class="cfg-field">
           <label class="cfg-label">API Version</label>
@@ -860,7 +869,7 @@ body {
               placeholder="https://jira.example.com" />
             <span class="cfg-ack" id="jira-url-ack">Saved</span>
           </div>
-          <span class="cfg-hint">Leave empty to use MCP path instead</span>
+          <!-- <span class="cfg-hint">Leave empty to use MCP path instead</span> -->
         </div>
         <div class="cfg-field">
           <label class="cfg-label">API Version</label>
@@ -912,6 +921,14 @@ body {
             <span class="cfg-ack" id="noproxy-hosts-ack">Saved</span>
           </div>
           <span class="cfg-hint">Comma-separated hostnames that bypass the system proxy for direct HTTP calls</span>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label cfg-checkbox-label">
+            <input type="checkbox" id="allow-insecure-tls" ${cfg.allowInsecureTls ? 'checked' : ''} />
+            Allow insecure TLS
+            <span class="cfg-ack" id="allow-insecure-tls-ack">Saved</span>
+          </label>
+          <span class="cfg-hint">Disable certificate verification for bypass hosts — use only if you get CERT errors with a corporate CA</span>
         </div>
       </div>
     </div>
@@ -970,6 +987,15 @@ body {
 
   watchChange('gitlab-api-ver', 'saveGitlabApiVer');
   watchChange('jira-api-ver',   'saveJiraApiVer');
+
+  // Checkbox — save on change
+  (function() {
+    const el = document.getElementById('allow-insecure-tls');
+    if (!el) { return; }
+    el.addEventListener('change', function() {
+      vscode.postMessage({ type: 'saveAllowInsecureTls', value: el.checked });
+    });
+  })();
 </script>
 </body>
 </html>`;
@@ -1142,7 +1168,6 @@ body {
         `}
         <button class="btn-secondary" onclick="vscode.postMessage({type:'reviewMultiMR'})">
           ${this.icons.repoForked}<span>Review Remote MRs</span>
-          <span class="label-right">MCP</span>
         </button>
         <button class="btn-secondary" onclick="vscode.postMessage({type:'openConfigure'})" style="margin-top:4px;border-color:var(--border-default)">
           ${this.icons.settings}<span>Configuration</span>
