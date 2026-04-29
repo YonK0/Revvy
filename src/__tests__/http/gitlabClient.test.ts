@@ -189,4 +189,34 @@ describe('GitLabClient.fetchDiffs', () => {
     // The project path should be URL-encoded (slashes become %2F)
     expect(calledUrl).toContain('group%2Fsub%2Fproject');
   });
+
+  it('falls back to /changes when /diffs returns 500', async () => {
+    mockConfig('https://gitlab.example.com');
+
+    const changesPayload = {
+      id: 1, iid: 7,
+      changes: [
+        { diff: '@@ -1 +1 @@\n-a\n+b\n', new_path: 'src/fallback.ts', old_path: 'src/fallback.ts',
+          new_file: false, renamed_file: false, deleted_file: false },
+      ],
+    };
+
+    const requestSpy = vi.spyOn(BaseHttpClient.prototype as any, 'request')
+      // First call: /diffs — returns 500
+      .mockResolvedValueOnce({ status: 500, body: '{"message":"500 Internal Server Error"}', headers: {} })
+      // Second call: /changes — returns success
+      .mockResolvedValueOnce({ status: 200, body: JSON.stringify(changesPayload), headers: {} });
+
+    const client = new GitLabClient(makeCredentials());
+    const result = await client.fetchDiffs('group/project', 7);
+
+    // Should return the diff from the /changes response
+    expect(result).toHaveLength(1);
+    expect(result[0].new_path).toBe('src/fallback.ts');
+
+    // Second request must target the /changes endpoint
+    const secondUrl: string = requestSpy.mock.calls[1][0];
+    expect(secondUrl).toContain('/changes');
+    expect(secondUrl).not.toContain('/diffs');
+  });
 });

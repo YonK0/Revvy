@@ -708,20 +708,20 @@ function parseMrRef(input: string, defaultType: 'github' | 'gitlab' = 'github'):
   return null;
 }
 
-/** Collects all text parts from any MCP tool result shape. */
-function extractTextFromToolResult(result: any): string {
-  const parts: string[] = [];
-  for (const part of result?.content ?? []) {
-    if (part instanceof vscode.LanguageModelTextPart) {
-      parts.push(part.value);
-    } else if (typeof part?.value === 'string') {
-      parts.push(part.value);
-    } else if (typeof part === 'string') {
-      parts.push(part);
-    }
-  }
-  return parts.join('\n').trim();
-}
+// /** Collects all text parts from any MCP tool result shape. */
+// function extractTextFromToolResult(result: any): string {
+//   const parts: string[] = [];
+//   for (const part of result?.content ?? []) {
+//     if (part instanceof vscode.LanguageModelTextPart) {
+//       parts.push(part.value);
+//     } else if (typeof part?.value === 'string') {
+//       parts.push(part.value);
+//     } else if (typeof part === 'string') {
+//       parts.push(part);
+//     }
+//   }
+//   return parts.join('\n').trim();
+// }
 
 /**
  * Fetches the diff for a single PR/MR.
@@ -738,9 +738,10 @@ async function fetchMrDiff(ref: MrRef): Promise<string | null> {
     .getConfiguration('revvy.network')
     .get<boolean>('useDirectHttp', true);
 
-  if (!useDirectHttp) {
-    return fetchMrDiffViaMcp(ref);
-  }
+  // MCP fallback path is disabled — direct HTTP is always used.
+  // if (!useDirectHttp) {
+  //   return fetchMrDiffViaMcp(ref);
+  // }
 
   try {
     if (ref.type === 'gitlab') {
@@ -755,8 +756,10 @@ async function fetchMrDiff(ref: MrRef): Promise<string | null> {
 
     return null;
   } catch (err: any) {
+    const hostname = hostnameForRef(ref);
+    const friendly = classifyHttpError(err, hostname);
     console.log(`[Revvy] Direct HTTP fetch failed for ${ref.display}: ${err.message}`);
-    vscode.window.showErrorMessage(`Revvy: Failed to fetch diff for ${ref.display} — ${err.message}`);
+    vscode.window.showErrorMessage(`Revvy: Failed to fetch diff for ${ref.display} — ${friendly}`);
     return null;
   }
 }
@@ -776,126 +779,190 @@ async function fetchJiraTicketDirect(ticketId: string): Promise<string | null> {
       ticket.description || '(no description)',
     ].join('\n');
   } catch (err: any) {
+    const jiraBase = vscode.workspace.getConfiguration('revvy.jira').get<string>('baseUrl', '');
+    let jiraHost = jiraBase;
+    try { jiraHost = new URL(jiraBase.startsWith('http') ? jiraBase : `https://${jiraBase}`).hostname; } catch { /* ignore */ }
+    const friendly = classifyHttpError(err, jiraHost || 'jira');
     console.log(`[Revvy] Direct HTTP Jira fetch failed for ${ticketId}: ${err.message}`);
-    vscode.window.showErrorMessage(`Revvy: Failed to fetch ${ticketId} from Jira — ${err.message}`);
+    vscode.window.showErrorMessage(`Revvy: Failed to fetch ${ticketId} from Jira — ${friendly}`);
     return null;
   }
 }
 
 /**
- * Fetches the diff for a single PR/MR via the appropriate MCP tool.
- * Tries multiple tool names and input key variants to handle different
- * @modelcontextprotocol/server-github and server-gitlab versions.
+ * Converts a raw HTTP/network error into a user-friendly message.
+ *
+ * Detects two common corporate-network failure modes:
+ *  1. Squid proxy intercept — response body is HTML (Squid returns an HTML
+ *     error page).  formatError() embeds the first 500 chars of the body
+ *     in the error message, so we can match against it here.
+ *  2. Socket-level errors — ECONNRESET, ETIMEDOUT, ENOTFOUND, etc. that
+ *     indicate the proxy is swallowing the connection before reaching the
+ *     server.
+ *
+ * In both cases the fix is the same: add the hostname to Proxy Bypass Hosts
+ * in Revvy Configuration so that tls.connect() bypasses the proxy entirely.
  */
-/**
- * Inspects a tool's inputSchema.properties to pick the correct parameter name
- * from a priority-ordered list of candidates.  Returns the first candidate
- * that appears as a declared property, or the first candidate as a fallback
- * when the schema is unavailable (preserving old behaviour without an extra
- * invokeTool call).
- */
-function pickParamName(tool: any, candidates: string[]): string {
-  const props: Record<string, unknown> =
-    tool?.inputSchema?.properties ?? tool?.input_schema?.properties ?? {};
-  for (const candidate of candidates) {
-    if (Object.prototype.hasOwnProperty.call(props, candidate)) {
-      return candidate;
-    }
+function classifyHttpError(err: any, hostname: string): string {
+  const msg:  string = err.message  ?? '';
+  const code: string = err.code     ?? '';
+
+  // Detect Squid / proxy HTML in the response body (embedded by formatError)
+  if (
+    msg.includes('<html') ||
+    msg.includes('<HTML') ||
+    msg.includes('Squid') ||
+    msg.includes('The requested URL could not be retrieved')
+  ) {
+    return (
+      `Proxy intercepted the request. ` +
+      `Add "${hostname}" to Proxy Bypass Hosts in Revvy Configuration ` +
+      `(gear icon → Network card).`
+    );
   }
-  // Schema absent or property not found — use the first candidate as default
-  return candidates[0];
+
+  // Detect socket/connection errors
+  const connectionCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNABORTED']);
+  if (connectionCodes.has(code) || msg === 'aborted') {
+    return (
+      `Connection error (${code || 'aborted'}) reaching "${hostname}". ` +
+      `If this is a corporate host behind a proxy, add it to Proxy Bypass Hosts ` +
+      `in Revvy Configuration (gear icon → Network card).`
+    );
+  }
+
+  return msg;
 }
 
-async function fetchMrDiffViaMcp(ref: MrRef): Promise<string | null> {
-  const lm = vscode.lm as any;
-  if (typeof lm.invokeTool !== 'function') { return null; }
-
-  const tools: any[] = lm.tools ?? [];
-  console.log('[Revvy] MR fetch — available tools:', tools.map((t: any) => t.name));
-
-  const cts = new vscode.CancellationTokenSource();
-
-  if (ref.type === 'github') {
-    // Prefer a diff/files tool, fall back to any pull_request tool
-    const tool =
-      tools.find((t: any) => { const n = (t.name ?? '').toLowerCase(); return n.includes('pull_request') && (n.includes('diff') || n.includes('file') || n.includes('content')); }) ??
-      tools.find((t: any) => (t.name ?? '').toLowerCase().includes('pull_request'));
-
-    if (!tool) {
-      return null;
+/**
+ * Extracts the hostname from a MrRef for use in error messages.
+ * For full URLs this is the URL hostname; for short refs we fall back
+ * to the configured base URL.
+ */
+function hostnameForRef(ref: MrRef): string {
+  try {
+    if (ref.display.startsWith('http')) {
+      return new URL(ref.display).hostname;
     }
-
-    // Inspect the tool's schema once to pick the correct PR-number param name,
-    // so we only need a single invokeTool call (= single VS Code consent dialog).
-    const prKey = pickParamName(tool, ['pullNumber', 'pull_number', 'pr_number']);
-    const input = { owner: ref.owner, repo: ref.repo, [prKey]: ref.number };
-    console.log(`[Revvy] GitHub tool ${tool.name} — using param "${prKey}"`);
-    try {
-      const result = await lm.invokeTool(tool.name, { input }, cts.token);
-      const text = extractTextFromToolResult(result);
-      if (text) {
-        return text;
-      }
-    } catch (e: any) {
-      console.log(`[Revvy] GitHub tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
-    }
-    return null;
-  }
-
+  } catch { /* ignore */ }
+  // Short ref — use the configured base URL
   if (ref.type === 'gitlab') {
-    // Split on underscores and find the first segment that is an action verb
-    // (skip server-prefix segments like "gitlab", "mcp", etc.).
-    // Only the action verb determines whether the tool is read-only or mutating.
-    // e.g. "gitlab_get_merge_request_diffs" → action = "get"   ✓ read
-    //      "gitlab_create_merge_request"    → action = "create" ✗ mutating
-    //      "get_merge_request"              → action = "get"    ✓ read
-    const MUTATING_VERBS = new Set([
-      'create', 'update', 'delete', 'close', 'reopen',
-      'approve', 'unapprove', 'edit', 'post', 'put', 'patch',
-    ]);
-    const NON_VERB_PREFIXES = new Set(['gitlab', 'github', 'mcp', 'server', 'gl', 'gh']);
-    const isReadMrTool = (name: string): boolean => {
-      const n = name.toLowerCase();
-      if (!n.includes('merge_request')) { return false; }
-      const segments = n.split('_');
-      // Find the first segment that looks like an action verb (not a server prefix)
-      const actionVerb = segments.find(s => !NON_VERB_PREFIXES.has(s)) ?? segments[0];
-      return !MUTATING_VERBS.has(actionVerb);
-    };
-
-    const tool =
-      tools.find((t: any) => { const n = (t.name ?? '').toLowerCase(); return isReadMrTool(n) && (n.includes('diff') || n.includes('change')); }) ??
-      tools.find((t: any) => { const n = (t.name ?? '').toLowerCase(); return isReadMrTool(n) && n.includes('get'); }) ??
-      tools.find((t: any) => isReadMrTool((t.name ?? '').toLowerCase()));
-
-    if (!tool) {
-      console.log('[Revvy] No read-only GitLab merge_request tool found. Available tools:', tools.map((t: any) => t.name));
-      return null;
-    }
-
-    // Inspect the tool's schema once to pick the correct parameter names,
-    // so we only need a single invokeTool call (= single VS Code consent dialog).
-    const projectKey = pickParamName(tool, ['project_id', 'project', 'project_path']);
-    const mrKey      = pickParamName(tool, ['mr_iid', 'merge_request_iid', 'iid']);
-    const projectPath = ref.owner ? `${ref.owner}/${ref.repo}` : ref.repo;
-    const input = { [projectKey]: projectPath, [mrKey]: ref.number };
-    console.log(`[Revvy] Using GitLab tool: ${tool.name} — params "${projectKey}", "${mrKey}"`);
-    const cts2 = new vscode.CancellationTokenSource();
-    try {
-      const result = await lm.invokeTool(tool.name, { input }, cts2.token);
-      const text = extractTextFromToolResult(result);
-      if (text) {
-        const normalized = normalizeGitLabDiffResponse(text);
-        return normalized;
-      }
-    } catch (e: any) {
-      console.log(`[Revvy] GitLab tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
-    }
-    return null;
+    const base = vscode.workspace.getConfiguration('revvy.gitlab').get<string>('baseUrl', '');
+    try { return new URL(base.startsWith('http') ? base : `https://${base}`).hostname; } catch { /* ignore */ }
   }
-
-  return null;
+  return ref.type === 'github' ? 'github.com' : 'gitlab.com';
 }
+
+
+// /**
+//  * Inspects a tool's inputSchema.properties to pick the correct parameter name
+//  * from a priority-ordered list of candidates.  Returns the first candidate
+//  * that appears as a declared property, or the first candidate as a fallback
+//  * when the schema is unavailable (preserving old behaviour without an extra
+//  * invokeTool call).
+//  */
+// function pickParamName(tool: any, candidates: string[]): string {
+//   const props: Record<string, unknown> =
+//     tool?.inputSchema?.properties ?? tool?.input_schema?.properties ?? {};
+//   for (const candidate of candidates) {
+//     if (Object.prototype.hasOwnProperty.call(props, candidate)) {
+//       return candidate;
+//     }
+//   }
+//   // Schema absent or property not found — use the first candidate as default
+//   return candidates[0];
+// }
+
+// async function fetchMrDiffViaMcp(ref: MrRef): Promise<string | null> {
+//   const lm = vscode.lm as any;
+//   if (typeof lm.invokeTool !== 'function') { return null; }
+//
+//   const tools: any[] = lm.tools ?? [];
+//   console.log('[Revvy] MR fetch — available tools:', tools.map((t: any) => t.name));
+//
+//   const cts = new vscode.CancellationTokenSource();
+//
+//   if (ref.type === 'github') {
+//     // Prefer a diff/files tool, fall back to any pull_request tool
+//     const tool =
+//       tools.find((t: any) => { const n = (t.name ?? '').toLowerCase(); return n.includes('pull_request') && (n.includes('diff') || n.includes('file') || n.includes('content')); }) ??
+//       tools.find((t: any) => (t.name ?? '').toLowerCase().includes('pull_request'));
+//
+//     if (!tool) {
+//       return null;
+//     }
+//
+//     // Inspect the tool's schema once to pick the correct PR-number param name,
+//     // so we only need a single invokeTool call (= single VS Code consent dialog).
+//     const prKey = pickParamName(tool, ['pullNumber', 'pull_number', 'pr_number']);
+//     const input = { owner: ref.owner, repo: ref.repo, [prKey]: ref.number };
+//     console.log(`[Revvy] GitHub tool ${tool.name} — using param "${prKey}"`);
+//     try {
+//       const result = await lm.invokeTool(tool.name, { input }, cts.token);
+//       const text = extractTextFromToolResult(result);
+//       if (text) {
+//         return text;
+//       }
+//     } catch (e: any) {
+//       console.log(`[Revvy] GitHub tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
+//     }
+//     return null;
+//   }
+//
+//   if (ref.type === 'gitlab') {
+//     // Split on underscores and find the first segment that is an action verb
+//     // (skip server-prefix segments like "gitlab", "mcp", etc.).
+//     // Only the action verb determines whether the tool is read-only or mutating.
+//     // e.g. "gitlab_get_merge_request_diffs" → action = "get"   ✓ read
+//     //      "gitlab_create_merge_request"    → action = "create" ✗ mutating
+//     //      "get_merge_request"              → action = "get"    ✓ read
+//     const MUTATING_VERBS = new Set([
+//       'create', 'update', 'delete', 'close', 'reopen',
+//       'approve', 'unapprove', 'edit', 'post', 'put', 'patch',
+//     ]);
+//     const NON_VERB_PREFIXES = new Set(['gitlab', 'github', 'mcp', 'server', 'gl', 'gh']);
+//     const isReadMrTool = (name: string): boolean => {
+//       const n = name.toLowerCase();
+//       if (!n.includes('merge_request')) { return false; }
+//       const segments = n.split('_');
+//       // Find the first segment that looks like an action verb (not a server prefix)
+//       const actionVerb = segments.find(s => !NON_VERB_PREFIXES.has(s)) ?? segments[0];
+//       return !MUTATING_VERBS.has(actionVerb);
+//     };
+//
+//     const tool =
+//       tools.find((t: any) => { const n = (t.name ?? '').toLowerCase(); return isReadMrTool(n) && (n.includes('diff') || n.includes('change')); }) ??
+//       tools.find((t: any) => { const n = (t.name ?? '').toLowerCase(); return isReadMrTool(n) && n.includes('get'); }) ??
+//       tools.find((t: any) => isReadMrTool((t.name ?? '').toLowerCase()));
+//
+//     if (!tool) {
+//       console.log('[Revvy] No read-only GitLab merge_request tool found. Available tools:', tools.map((t: any) => t.name));
+//       return null;
+//     }
+//
+//     // Inspect the tool's schema once to pick the correct parameter names,
+//     // so we only need a single invokeTool call (= single VS Code consent dialog).
+//     const projectKey = pickParamName(tool, ['project_id', 'project', 'project_path']);
+//     const mrKey      = pickParamName(tool, ['mr_iid', 'merge_request_iid', 'iid']);
+//     const projectPath = ref.owner ? `${ref.owner}/${ref.repo}` : ref.repo;
+//     const input = { [projectKey]: projectPath, [mrKey]: ref.number };
+//     console.log(`[Revvy] Using GitLab tool: ${tool.name} — params "${projectKey}", "${mrKey}"`);
+//     const cts2 = new vscode.CancellationTokenSource();
+//     try {
+//       const result = await lm.invokeTool(tool.name, { input }, cts2.token);
+//       const text = extractTextFromToolResult(result);
+//       if (text) {
+//         const normalized = normalizeGitLabDiffResponse(text);
+//         return normalized;
+//       }
+//     } catch (e: any) {
+//       console.log(`[Revvy] GitLab tool ${tool.name} failed (${JSON.stringify(input)}): ${e.message}`);
+//     }
+//     return null;
+//   }
+//
+//   return null;
+// }
 
 async function reviewMultiMR() {
   const loader = await ensureRuleLoader();
@@ -1016,7 +1083,7 @@ async function reviewMultiMR() {
         const useDirectHttp = vscode.workspace.getConfiguration('revvy.network').get<boolean>('useDirectHttp', true);
         const hint = useDirectHttp
           ? `Check that revvy.${hostTypes.map(h => h.toLowerCase()).join('/')} .baseUrl is configured and credentials are set.`
-          : `Ensure the ${hostTypes.join(' / ')} MCP server is running (.vscode/mcp.json).`;
+          : `Check that revvy.${hostTypes.map(h => h.toLowerCase()).join('/')} .baseUrl is configured and credentials are set.`;
         const msg = `Could not fetch diff for: ${failed.join(', ')}. ${hint}`;
         if (diffs.length === 0) { vscode.window.showErrorMessage(msg); return; }
         vscode.window.showWarningMessage(msg);
@@ -1074,7 +1141,7 @@ async function reviewMultiMR() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Jira MCP helpers
+// Jira MCP helpers (disabled — direct HTTP path is used instead)
 // ────────────────────────────────────────────────────────────────────────────
 
 /** Returns the Jira ticket key if `text` is exactly a Jira ID (e.g. PROJ-123), else null. */
@@ -1083,85 +1150,85 @@ function detectJiraId(text: string): string | null {
   return match ? match[1].toUpperCase() : null;
 }
 
-/**
- * Invokes the `jira_get_issue` MCP tool (provided by mcp-atlassian)
- * via VS Code's Language Model Tools API (available from VS Code 1.96+).
- * Returns the ticket text on success, null when MCP is unavailable or not configured.
- * `errors` collects human-readable failure messages from all variant attempts.
- */
-async function fetchJiraTicketViaMcp(ticketId: string): Promise<{ text: string | null; errors: string[] }> {
-  const lm = vscode.lm as any;
-  const errors: string[] = [];
-
-  // vscode.lm.invokeTool was stabilised in VS Code 1.96
-  if (typeof lm.invokeTool !== 'function') {
-    console.log('[Revvy] vscode.lm.invokeTool not available (VS Code < 1.96)');
-    return { text: null, errors: ['vscode.lm.invokeTool not available (VS Code < 1.96)'] };
-  }
-
-  // List all available LM tools for diagnostics
-  const tools: any[] = lm.tools ?? [];
-  console.log('[Revvy] Available LM tools:', tools.map((t: any) => t.name));
-
-  // Broad match: any tool whose name contains both "jira" and "issue" (case-insensitive)
-  // Covers: jira_get_issue, atlassian_jira_get_issue, mcp__atlassian__jira_get_issue, etc.
-  const jiraTool = tools.find((t: any) => {
-    const n: string = (t.name ?? '').toLowerCase();
-    return n.includes('jira') && (n.includes('issue') || n.includes('get'));
-  });
-
-  if (!jiraTool) {
-    const toolNames = tools.map((t: any) => t.name).join(', ') || '(none)';
-    const msg = `No Jira tool found. Registered tools: ${toolNames}`;
-    console.log(`[Revvy] ${msg}`);
-    return { text: null, errors: [msg] };
-  }
-
-  console.log(`[Revvy] Using tool: ${jiraTool.name}`);
-
-  // Try all common input key formats used by different mcp-atlassian versions
-  const inputVariants = [
-    { issue_key: ticketId },
-    { issueKey: ticketId },
-    { key: ticketId },
-    { issue_id: ticketId },
-    { id: ticketId },
-  ];
-
-  const cts = new vscode.CancellationTokenSource();
-
-  for (const input of inputVariants) {
-    try {
-      const result = await lm.invokeTool(
-        jiraTool.name,
-        { input },
-        cts.token
-      );
-
-      // Collect all text parts from the tool result
-      const parts: string[] = [];
-      for (const part of result.content ?? []) {
-        if (part instanceof vscode.LanguageModelTextPart) {
-          parts.push(part.value);
-        } else if (typeof part?.value === 'string') {
-          parts.push(part.value);
-        } else if (typeof part === 'string') {
-          parts.push(part);
-        }
-      }
-      const text = parts.join('\n').trim();
-      if (text) {
-        return { text, errors };
-      }
-    } catch (err: any) {
-      const msg = `Tool call failed with input ${JSON.stringify(input)}: ${err.message}`;
-      console.log(`[Revvy] ${msg}`);
-      errors.push(msg);
-    }
-  }
-
-  return { text: null, errors };
-}
+// /**
+//  * Invokes the `jira_get_issue` MCP tool (provided by mcp-atlassian)
+//  * via VS Code's Language Model Tools API (available from VS Code 1.96+).
+//  * Returns the ticket text on success, null when MCP is unavailable or not configured.
+//  * `errors` collects human-readable failure messages from all variant attempts.
+//  */
+// async function fetchJiraTicketViaMcp(ticketId: string): Promise<{ text: string | null; errors: string[] }> {
+//   const lm = vscode.lm as any;
+//   const errors: string[] = [];
+//
+//   // vscode.lm.invokeTool was stabilised in VS Code 1.96
+//   if (typeof lm.invokeTool !== 'function') {
+//     console.log('[Revvy] vscode.lm.invokeTool not available (VS Code < 1.96)');
+//     return { text: null, errors: ['vscode.lm.invokeTool not available (VS Code < 1.96)'] };
+//   }
+//
+//   // List all available LM tools for diagnostics
+//   const tools: any[] = lm.tools ?? [];
+//   console.log('[Revvy] Available LM tools:', tools.map((t: any) => t.name));
+//
+//   // Broad match: any tool whose name contains both "jira" and "issue" (case-insensitive)
+//   // Covers: jira_get_issue, atlassian_jira_get_issue, mcp__atlassian__jira_get_issue, etc.
+//   const jiraTool = tools.find((t: any) => {
+//     const n: string = (t.name ?? '').toLowerCase();
+//     return n.includes('jira') && (n.includes('issue') || n.includes('get'));
+//   });
+//
+//   if (!jiraTool) {
+//     const toolNames = tools.map((t: any) => t.name).join(', ') || '(none)';
+//     const msg = `No Jira tool found. Registered tools: ${toolNames}`;
+//     console.log(`[Revvy] ${msg}`);
+//     return { text: null, errors: [msg] };
+//   }
+//
+//   console.log(`[Revvy] Using tool: ${jiraTool.name}`);
+//
+//   // Try all common input key formats used by different mcp-atlassian versions
+//   const inputVariants = [
+//     { issue_key: ticketId },
+//     { issueKey: ticketId },
+//     { key: ticketId },
+//     { issue_id: ticketId },
+//     { id: ticketId },
+//   ];
+//
+//   const cts = new vscode.CancellationTokenSource();
+//
+//   for (const input of inputVariants) {
+//     try {
+//       const result = await lm.invokeTool(
+//         jiraTool.name,
+//         { input },
+//         cts.token
+//       );
+//
+//       // Collect all text parts from the tool result
+//       const parts: string[] = [];
+//       for (const part of result.content ?? []) {
+//         if (part instanceof vscode.LanguageModelTextPart) {
+//           parts.push(part.value);
+//         } else if (typeof part?.value === 'string') {
+//           parts.push(part.value);
+//         } else if (typeof part === 'string') {
+//           parts.push(part);
+//         }
+//       }
+//       const text = parts.join('\n').trim();
+//       if (text) {
+//         return { text, errors };
+//       }
+//     } catch (err: any) {
+//       const msg = `Tool call failed with input ${JSON.stringify(input)}: ${err.message}`;
+//       console.log(`[Revvy] ${msg}`);
+//       errors.push(msg);
+//     }
+//   }
+//
+//   return { text: null, errors };
+// }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Ticket Requirements Management
@@ -1215,40 +1282,41 @@ async function setTicketRequirements() {
           }
           // On failure fetchJiraTicketDirect already showed an error message;
           // requirementText keeps its value (the raw jiraId string) as a reference.
-        } else {
-          // ── MCP path (legacy / opt-in) ──────────────────────────────────
-          const { text: fetched, errors: fetchErrors } = await fetchJiraTicketViaMcp(jiraId);
-          if (fetched) {
-            requirementText = `Jira Ticket: ${jiraId}\n\n${fetched}`;
-            vscode.window.showInformationMessage(`✅ Fetched ${jiraId} from Jira via MCP`);
-          } else {
-            // MCP not available or Atlassian server not running — store the ID as a reference
-            requirementText =
-              `Jira Ticket ID: ${jiraId}\n` +
-              `(Auto-fetch unavailable. Configure the Atlassian MCP server in .vscode/mcp.json ` +
-              `and set revvy.jiraBaseUrl / revvy.jiraEmail in settings.)`;
-
-            const errorDetail = fetchErrors.length > 0
-              ? ` Errors: ${fetchErrors.slice(0, 2).join('; ')}`
-              : '';
-            const sel = await vscode.window.showWarningMessage(
-              `Jira MCP tool not reachable. Stored "${jiraId}" as reference.${errorDetail}`,
-              'Open .vscode/mcp.json',
-              'MCP Atlassian Docs'
-            );
-            if (sel === 'Open .vscode/mcp.json') {
-              const mcpUri = vscode.Uri.joinPath(
-                vscode.workspace.workspaceFolders![0].uri,
-                '.vscode', 'mcp.json'
-              );
-              vscode.window.showTextDocument(mcpUri);
-            } else if (sel === 'MCP Atlassian Docs') {
-              vscode.env.openExternal(
-                vscode.Uri.parse('https://github.com/sooperset/mcp-atlassian')
-              );
-            }
-          }
-        }
+        } // MCP fallback path is disabled.
+        // } else {
+        //   // ── MCP path (legacy / opt-in) ──────────────────────────────────
+        //   const { text: fetched, errors: fetchErrors } = await fetchJiraTicketViaMcp(jiraId);
+        //   if (fetched) {
+        //     requirementText = `Jira Ticket: ${jiraId}\n\n${fetched}`;
+        //     vscode.window.showInformationMessage(`✅ Fetched ${jiraId} from Jira via MCP`);
+        //   } else {
+        //     // MCP not available or Atlassian server not running — store the ID as a reference
+        //     requirementText =
+        //       `Jira Ticket ID: ${jiraId}\n` +
+        //       `(Auto-fetch unavailable. Configure the Atlassian MCP server in .vscode/mcp.json ` +
+        //       `and set revvy.jiraBaseUrl / revvy.jiraEmail in settings.)`;
+        //
+        //     const errorDetail = fetchErrors.length > 0
+        //       ? ` Errors: ${fetchErrors.slice(0, 2).join('; ')}`
+        //       : '';
+        //     const sel = await vscode.window.showWarningMessage(
+        //       `Jira MCP tool not reachable. Stored "${jiraId}" as reference.${errorDetail}`,
+        //       'Open .vscode/mcp.json',
+        //       'MCP Atlassian Docs'
+        //     );
+        //     if (sel === 'Open .vscode/mcp.json') {
+        //       const mcpUri = vscode.Uri.joinPath(
+        //         vscode.workspace.workspaceFolders![0].uri,
+        //         '.vscode', 'mcp.json'
+        //       );
+        //       vscode.window.showTextDocument(mcpUri);
+        //     } else if (sel === 'MCP Atlassian Docs') {
+        //       vscode.env.openExternal(
+        //         vscode.Uri.parse('https://github.com/sooperset/mcp-atlassian')
+        //       );
+        //     }
+        //   }
+        // }
       }
     );
   }

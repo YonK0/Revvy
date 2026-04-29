@@ -103,9 +103,29 @@ export class GitLabClient extends BaseHttpClient {
   /**
    * Fetches all diff files for a GitLab MR, handling pagination automatically.
    * Returns at most 1 000 files (10 pages × 100) — a hard safety cap.
+   * Falls back to the older /changes endpoint if /diffs returns 500.
    */
   async fetchDiffs(projectId: string, mrIid: number): Promise<GitLabDiffFile[]> {
     const encoded = encodeURIComponent(projectId);
+    try {
+      return await this.fetchDiffsViaNewEndpoint(encoded, mrIid);
+    } catch (err: any) {
+      if (err?.status === 500) {
+        console.log('[Revvy] /diffs returned 500, falling back to /changes');
+        return this.fetchDiffsViaChanges(encoded, mrIid);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Paginated fetch via the newer /diffs endpoint (GitLab ≥15.x).
+   * Returns bare GitLabDiffFile[].
+   */
+  private async fetchDiffsViaNewEndpoint(
+    encoded: string,
+    mrIid:   number,
+  ): Promise<GitLabDiffFile[]> {
     const all: GitLabDiffFile[] = [];
     let page = 1;
 
@@ -121,5 +141,24 @@ export class GitLabClient extends BaseHttpClient {
     }
 
     return all;
+  }
+
+  /**
+   * Fallback fetch via the older /changes endpoint.
+   * Returns {id, iid, changes: GitLabDiffFile[]} — we extract .changes.
+   */
+  private async fetchDiffsViaChanges(
+    encoded: string,
+    mrIid:   number,
+  ): Promise<GitLabDiffFile[]> {
+    const data = await this.apiCall(
+      `/projects/${encoded}/merge_requests/${mrIid}/changes`,
+    );
+    const changes: GitLabDiffFile[] = Array.isArray(data.changes)
+      ? data.changes
+      : Array.isArray(data)
+        ? data
+        : [];
+    return changes;
   }
 }
