@@ -35,6 +35,19 @@ const MAX_TOOL_RESULT_CHARS          = 12_000;
 const GROUNDING_SYMBOL_RESULT_CHARS  = 3_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Remote file reader type
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Async function that retrieves the raw content of a remote file.
+ *
+ * @param path - File path relative to the repository root (e.g. "src/foo.c")
+ * @param repo - Optional "owner/repo" string, required when the review spans
+ *               multiple repositories simultaneously.
+ */
+export type RemoteFileReader = (path: string, repo?: string) => Promise<string>;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Output-channel logger (lazy — created on first Deep Review)
 // Open in VS Code: View → Output → "Revvy — Deep Review"
 // ─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +159,108 @@ const DEEP_REVIEW_TOOLS: vscode.LanguageModelChatTool[] = [
           description: 'Glob pattern to match (default: "**/*")',
         },
       },
+    },
+  },
+];
+
+/**
+ * Tool set for remote (PR/MR) Deep Reviews.
+ *
+ * Differences from DEEP_REVIEW_TOOLS:
+ *  - `readFile` gains an optional `repo` field for multi-repo reviews.
+ *  - `searchSymbol` is omitted — no local workspace to search; the grounding
+ *    phase calls executeTool('searchSymbol') directly with a diff-text fallback.
+ *  - `listWorkspaceFiles` lists the files changed in the diff instead of
+ *    querying the local filesystem.
+ */
+const DEEP_REVIEW_TOOLS_REMOTE: vscode.LanguageModelChatTool[] = [
+  {
+    name: 'readFile',
+    description:
+      'Read a file from the remote repository. Returns up to 500 lines (or the requested range). ' +
+      'Use this to understand code that was changed or that references changed symbols.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path relative to the repository root (e.g. "src/foo.c")',
+        },
+        startLine: {
+          type: 'number',
+          description: 'First line to return, 1-indexed (optional)',
+        },
+        endLine: {
+          type: 'number',
+          description: 'Last line to return, 1-indexed (optional)',
+        },
+        repo: {
+          type: 'string',
+          description:
+            'Repository in "owner/repo" format. Required only when reviewing ' +
+            'multiple repositories simultaneously. Omit for single-repo reviews.',
+        },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'listChangedFiles',
+    description:
+      'List all files that were changed in this diff. ' +
+      'Use this first to understand the scope of the change.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'getFileDiff',
+    description:
+      'Get the full diff section for a specific file in this review. ' +
+      'Use this to inspect exactly what changed in a file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: {
+          type: 'string',
+          description: 'Path of the file as shown in the diff header',
+        },
+      },
+      required: ['filePath'],
+    },
+  },
+  {
+    name: 'listWorkspaceFiles',
+    description:
+      'List files in this PR/MR that match a description. ' +
+      'Use this to understand the scope of changed files before reading specific ones.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        glob: {
+          type: 'string',
+          description: 'Optional filter pattern (default: all changed files)',
+        },
+      },
+    },
+  },
+  {
+    name: 'searchSymbol',
+    description:
+      'Search for a symbol or text pattern within the files changed in this PR/MR. ' +
+      'Returns matches as "filepath:linenum: content" — the same format as a workspace search. ' +
+      'IMPORTANT: only searches lines visible in the diff (added + context lines). ' +
+      'Use readFile to read full file content beyond what the diff shows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: {
+          type: 'string',
+          description: 'Symbol name or text pattern to search for (case-sensitive)',
+        },
+      },
+      required: ['pattern'],
     },
   },
 ];
@@ -432,10 +547,13 @@ export function extractSymbolsFromRequirements(text: string): Set<string> {
 // Tool executor
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function executeTool(
+/** Exported for unit testing. Do not call directly in production — use runDeepReview(). */
+export async function executeTool(
   name: string,
   input: Record<string, unknown>,
   diff: string,
+  remoteReader?: RemoteFileReader,
+  sources?: ReviewSource[],
 ): Promise<string> {
   const workspaceFolders = vscode.workspace.workspaceFolders;
   const workspaceRoot = workspaceFolders?.[0]?.uri?.fsPath ?? '';
@@ -444,6 +562,24 @@ async function executeTool(
     switch (name) {
       case 'readFile': {
         const rel = (input.path as string).trim();
+
+        // ── Remote path: read from the remote repo via the provided reader ───
+        if (remoteReader) {
+          const repo = typeof input.repo === 'string' ? input.repo.trim() || undefined : undefined;
+          try {
+            const text = await remoteReader(rel, repo);
+            const lines = text.split('\n');
+            const start = typeof input.startLine === 'number' ? input.startLine - 1 : 0;
+            const end = typeof input.endLine === 'number'
+              ? input.endLine
+              : Math.min(lines.length, start + 500);
+            return trimToolResult(lines.slice(start, end).join('\n'));
+          } catch (err: any) {
+            return `[readFile error: ${err.message ?? String(err)}]`;
+          }
+        }
+
+        // ── Local path: read from workspace filesystem ─────────────────────
         // Block any path traversal attempts
         const resolved = nodePath.resolve(workspaceRoot, rel);
         if (!resolved.startsWith(workspaceRoot)) {
@@ -478,6 +614,62 @@ async function executeTool(
 
       case 'searchSymbol': {
         const pattern = (input.pattern as string).trim();
+
+        // ── Remote path: search diff text, resolving real file:line refs ──────
+        // Parse diff headers and @@ hunk markers so results are returned as
+        //   "filepath:filelinenum: content"
+        // matching the local workspace search format.  This gives the model
+        // accurate line numbers to use in its JSON output — the old approach
+        // of "diff:N: ..." caused the model to use diff-string line numbers as
+        // file line numbers, producing misaligned codeFragment/line fields.
+        if (remoteReader) {
+          const diffLines = diff.split('\n');
+          const results: string[] = [];
+          let currentFile = '';
+          let fileLineNum  = 0;
+
+          for (const line of diffLines) {
+            // "diff --git a/... b/path" — extract the b/ side (new file path)
+            const fileHeaderMatch = line.match(/^diff --git [^ ]+ b\/(.+)$/);
+            if (fileHeaderMatch) {
+              currentFile = fileHeaderMatch[1];
+              fileLineNum  = 0;
+              continue;
+            }
+            // Skip +++ / --- meta lines (they are not content)
+            if (line.startsWith('+++') || line.startsWith('---')) { continue; }
+            // "@@ -old +new,len @@" — seed the new-file line counter
+            const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+            if (hunkMatch) {
+              fileLineNum = parseInt(hunkMatch[1], 10) - 1; // decremented before first use
+              continue;
+            }
+            // Added lines (+) and context lines (space) both advance the new-file counter.
+            // Removed lines (-) do NOT — they are gone in the new file.
+            if (line.startsWith('+') && !line.startsWith('+++')) {
+              fileLineNum++;
+              if (line.includes(pattern)) {
+                const ref = currentFile ? `${currentFile}:${fileLineNum}` : `unknown:${fileLineNum}`;
+                results.push(`${ref}: ${line.slice(1).trim()}`);
+                if (results.length >= 200) { break; }
+              }
+            } else if (line.startsWith(' ')) {
+              fileLineNum++;
+              if (line.includes(pattern)) {
+                const ref = currentFile ? `${currentFile}:${fileLineNum}` : `unknown:${fileLineNum}`;
+                results.push(`${ref}: ${line.slice(1).trim()}`);
+                if (results.length >= 200) { break; }
+              }
+            }
+          }
+
+          if (results.length === 0) {
+            return `(no matches found for "${pattern}" in diff)`;
+          }
+          return trimToolResult(results.join('\n'));
+        }
+
+        // ── Local path: search workspace files ────────────────────────────
         const fileGlob = typeof input.fileGlob === 'string' ? input.fileGlob : '**/*';
         const files = await vscode.workspace.findFiles(
           fileGlob,
@@ -505,6 +697,15 @@ async function executeTool(
       }
 
       case 'listWorkspaceFiles': {
+        // ── Remote path: list files from the diff ─────────────────────────
+        if (remoteReader) {
+          const sections = splitDiffByFile(diff);
+          const paths = [...new Set(sections.map(s => s.filePath))];
+          if (paths.length === 0) { return '(no files found)'; }
+          return paths.join('\n');
+        }
+
+        // ── Local path: find files matching glob ──────────────────────────
         const glob = typeof input.glob === 'string' ? input.glob : '**/*';
         const files = await vscode.workspace.findFiles(
           glob,
@@ -598,6 +799,53 @@ function buildDeepUserPrompt(
     `- Score harshly: 7-8=acceptable, 5-6=needs work, 3-4=significant issues, 1-2=major problems\n` +
     `- Reference rule ID in every comment\n` +
     `- No praise, focus on problems only\n\n` +
+    `## Test Generation Rules\n` +
+    `- Generate system-level integration tests describing observable behavior on the real system.\n` +
+    `- Max 6 scenarios total, up to 2 per category. Fewer sharp tests beat many shallow ones.\n` +
+    `- Omit entirely if the diff is purely cosmetic (whitespace, comments, renames with no logic change).\n` +
+    `- Categories (include at least one from each that applies):\n` +
+    `  • "functional"  — happy-path workflow, expected behavior under normal operating conditions.\n` +
+    `  • "security"    — unintended side effects on adjacent data, unauthorized access, data leakage,\n` +
+    `                    lock leaks that block the system.\n` +
+    `  • "boundary"    — behavior at limits: maximum sizes, first/last element, partial failure,\n` +
+    `                    verifying ONLY the intended data region is affected and nothing adjacent changes.\n` +
+    `  • "performance" — time impact on real workflows, system responsiveness during the operation,\n` +
+    `                    watchdog safety under worst-case load.\n` +
+    `- Step format — OBSERVABLE SYSTEM ACTIONS ONLY:\n` +
+    `  • Write steps as real-world actions a tester performs on the actual running system.\n` +
+    `  • FORBIDDEN in every step: any symbol, function name, variable name, constant, opcode value,\n` +
+    `    register name, or identifier that appears anywhere in the source files — including names you\n` +
+    `    discovered by reading files or searching symbols during this review session.\n` +
+    `    EXCEPTION: identifiers explicitly mentioned in the ## Requirements section above are permitted,\n` +
+    `    because the requirements author already made them part of the specification.\n` +
+    `  • FORBIDDEN as preconditions: compile-time flag toggles, fault injection into specific\n` +
+    `    lower-level functions, hardware reconfigurations a normal tester cannot perform.\n` +
+    `  • Preconditions must describe observable SYSTEM STATE: device powered on, firmware loaded,\n` +
+    `    interface showing a specific menu or state.\n` +
+    `  • Title format: "<Feature area> — <what could go wrong in plain English>".\n` +
+    `  • NO hedge words (try, consider, maybe). Direct imperative commands only.\n` +
+    `- CORRECT examples:\n` +
+    `  • "Navigate to the parameter management section, trigger the erase workflow, and verify\n` +
+    `    all stored parameters are reset to their factory-default values"\n` +
+    `  • "Load the device with the new firmware version, power-cycle, and verify it boots correctly\n` +
+    `    and all data remains accessible"\n` +
+    `  • "After triggering the erase operation, use a diagnostic tool to verify that the memory\n` +
+    `    regions outside the target area are completely unchanged"\n` +
+    `  • "Trigger the operation with the maximum allowed data size and verify the system remains\n` +
+    `    responsive throughout with no reset or timeout"\n` +
+    `  • "Trigger the operation twice in sequence and verify the second execution completes\n` +
+    `    successfully without error"\n` +
+    `- WRONG examples — NEVER write steps like these:\n` +
+    `  • "Trigger the operation by its internal opcode constant name" ← source-code identifier,\n` +
+    `    FORBIDDEN even if you read it during file exploration\n` +
+    `  • "Inject a fault so the lower-level handler returns failure on the second call"\n` +
+    `    ← implementation-level fault injection, not a real-world action\n` +
+    `  • "Enable the feature flag in the build configuration" ← compile-time toggle, not\n` +
+    `    something a tester can do on the running system\n` +
+    `  • "Inspect the internal return variable after the dispatch function returns"\n` +
+    `    ← internal diagnostic value, not observable by a tester\n` +
+    `  • "Reconfigure the watchdog to its minimum timeout value" ← hardware reconfiguration\n` +
+    `    outside normal test setup\n\n` +
     `## Instructions\n` +
     `You MUST explore the codebase using tools before writing your review.\n` +
     `Follow this sequence — do not skip steps:\n\n` +
@@ -885,8 +1133,11 @@ export async function runDeepReview(
   keys: AIKeys,  // kept for API symmetry with runReview; Copilot path uses vscode.lm
   onChunk?: StreamChunkCallback,
   sources?: ReviewSource[],
+  remoteReader?: RemoteFileReader,
 ): Promise<ReviewResult> {
   if (!diff.trim()) { throw new Error('No diff to review'); }
+
+  const isRemote = !!remoteReader;
 
   // ── Cost-control limits (user-configurable via VS Code settings) ──────────
   const cfg = vscode.workspace.getConfiguration('revvy');
@@ -935,7 +1186,7 @@ export async function runDeepReview(
   // This guarantees toolCallCount >= 1 and primes the conversation so the
   // model sees itself already mid-exploration and continues with steps 2-4.
   {
-    const groundingResult = await executeTool('listChangedFiles', {}, diff);
+    const groundingResult = await executeTool('listChangedFiles', {}, diff, remoteReader, sources);
     const groundingCallId = 'grounding-listChangedFiles';
     messages.push(vscode.LanguageModelChatMessage.Assistant([
       new vscode.LanguageModelToolCallPart(groundingCallId, 'listChangedFiles', {}),
@@ -962,7 +1213,7 @@ export async function runDeepReview(
     const autoGroundList = [...tier1, ...tier2]; // tier1 always first
     for (const sym of autoGroundList) {
       if (toolCallCount >= MAX_TOOL_CALLS) { break; } // safety net only
-      const raw = await executeTool('searchSymbol', { pattern: sym }, diff);
+      const raw = await executeTool('searchSymbol', { pattern: sym }, diff, remoteReader, sources);
       const trimmed = trimToolResult(raw, GROUNDING_SYMBOL_RESULT_CHARS);
       const callId = `grounding-searchSymbol-${sym}`;
       messages.push(vscode.LanguageModelChatMessage.Assistant([
@@ -1009,7 +1260,7 @@ export async function runDeepReview(
     for (const sym of reqSymbols) {
       if (alreadyGrounded.has(sym)) { continue; }
       if (toolCallCount >= MAX_TOOL_CALLS) { break; }
-      const raw = await executeTool('searchSymbol', { pattern: sym }, diff);
+      const raw = await executeTool('searchSymbol', { pattern: sym }, diff, remoteReader, sources);
       const trimmed = trimToolResult(raw, GROUNDING_SYMBOL_RESULT_CHARS);
       const callId = `grounding-req-searchSymbol-${sym}`;
       messages.push(vscode.LanguageModelChatMessage.Assistant([
@@ -1050,6 +1301,7 @@ export async function runDeepReview(
       const result = await forceFinalize(messages, model, cts, profile, Date.now() - start, onChunk);
       result.toolCallsUsed        = toolCallCount;
       result.estimatedInputTokens = Math.round(convSize / 4);
+      result.sources              = sources;
       log(`DONE  reason=context-cap  toolCalls=${toolCallCount}  duration=${Date.now() - start}ms`);
       return result;
     }
@@ -1057,7 +1309,7 @@ export async function runDeepReview(
     // Send request with tools available
     const response = await model.sendRequest(
       messages,
-      { tools: DEEP_REVIEW_TOOLS },
+      { tools: isRemote ? DEEP_REVIEW_TOOLS_REMOTE : DEEP_REVIEW_TOOLS },
       cts.token
     );
 
@@ -1089,6 +1341,7 @@ export async function runDeepReview(
       const result = parseDeepReviewResponse(text, profile, Date.now() - start, model.name || 'copilot');
       result.toolCallsUsed        = toolCallCount;
       result.estimatedInputTokens = Math.round(getConversationSize(messages) / 4);
+      result.sources              = sources;
       log(`DONE  reason=final-answer  toolCalls=${toolCallCount}  verdict=${result.verdict}  score=${result.score}  comments=${result.comments.length}  duration=${Date.now() - start}ms`);
       return result;
     }
@@ -1101,6 +1354,7 @@ export async function runDeepReview(
       const result = await forceFinalize(messages, model, cts, profile, Date.now() - start, onChunk);
       result.toolCallsUsed        = toolCallCount;
       result.estimatedInputTokens = Math.round(getConversationSize(messages) / 4);
+      result.sources              = sources;
       log(`DONE  reason=budget  toolCalls=${toolCallCount}  duration=${Date.now() - start}ms`);
       return result;
     }
@@ -1153,7 +1407,7 @@ export async function runDeepReview(
         console.log(`[Revvy] Deep Review: cache hit for ${call.name}`);
       } else {
         log(`CALL  ${call.name}  input=${JSON.stringify(call.input ?? {})}`);
-        result = await executeTool(call.name, (call.input ?? {}) as Record<string, unknown>, diff);
+        result = await executeTool(call.name, (call.input ?? {}) as Record<string, unknown>, diff, remoteReader, sources);
         // Cost control 3: result truncation happens inside executeTool via trimToolResult
         toolCache.set(cacheKey, result);
         toolCallCount++;

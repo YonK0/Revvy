@@ -1197,6 +1197,9 @@ body {
             <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">History (chars)</label>
           </div>
         </div>
+        <p id="deep-disclaimer" hidden style="margin:6px 0 0;font-size:10px;color:var(--fg-subtle);line-height:1.4">
+          Requires GitHub Copilot. For local diffs reads workspace files; for remote PR/MR reviews reads files directly from the repository at the PR head commit.
+        </p>
       </div>
 
       <!-- Review mode selector -->
@@ -1461,9 +1464,8 @@ body {
       <div class="step done"><div class="step-dot"></div>Loading rules</div>
       <div class="step active"><div class="step-dot"></div>Analyzing changes</div>
       <div class="step"><div class="step-dot"></div>Generating report</div>
-    </div>
-    <div class="live-counter" id="liveCounter"></div>
-  </div>
+        </div>
+      </div>
   <script>
     window.addEventListener('message', e => {
       const msg = e.data;
@@ -1554,8 +1556,11 @@ body {
         onclick="acquireVsCodeApi().postMessage({type:'goHome'})">Back to Home</button>
       <button class="try-again-btn"
         onclick="acquireVsCodeApi().postMessage({type:'runReview'})">Try Again</button>
-    </div>
-  </div>
+        </div>
+        <p id="deep-disclaimer" hidden style="margin:6px 0 0;font-size:10px;color:var(--fg-subtle);line-height:1.4">
+          Requires GitHub Copilot. Reads files from local workspace or, for remote PR/MR reviews, directly from the remote repository at the PR head SHA.
+        </p>
+      </div>
 </body>
 </html>`;
   }
@@ -1747,10 +1752,17 @@ body {
       // For remote reviews, render from the diff context stored on the comment.
       let codeSnippet: string;
       if (isRemote) {
-        // Part 3 fix: show file + line info in fallback instead of generic message
-        codeSnippet = c.codeContext
-          ? this.renderDiffContext(c.codeContext, c.codeContextStartLine ?? c.line, c.line, c.endLine, c.codeFragment)
-          : `<div class="card-code-unavailable">Diff unavailable for ${escapedFile} line ${c.line}.</div>`;
+        if (c.codeContext) {
+          // Quick remote review: diff context extracted during review
+          codeSnippet = this.renderDiffContext(c.codeContext, c.codeContextStartLine ?? c.line, c.line, c.endLine, c.codeFragment);
+        } else if (c.codeFragment) {
+          // Deep remote review: no codeContext, but AI provided a verbatim fragment —
+          // strip any diff +/-/space prefixes and render it directly at the reported line.
+          const stripped = c.codeFragment.split('\n').map(l => l.replace(/^[+\- ]/, '')).join('\n');
+          codeSnippet = this.renderDiffContext(stripped, c.line, c.line, c.endLine);
+        } else {
+          codeSnippet = `<div class="card-code-unavailable">Remote review — source unavailable locally.</div>`;
+        }
       } else {
         // Pass corrected line numbers; omit codeFragment (correction already done above).
         codeSnippet = this.renderCodeLine(fileLines, displayFirst, displayLast);

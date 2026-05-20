@@ -9,7 +9,7 @@ import { execSync, exec } from 'child_process';
 import { promisify } from 'util';
 import { RuleLoader, ReviewProfile } from './ruleLoader';
 import { runReview, autoDetectProfile, ReviewSource } from './reviewer';
-import { runDeepReview } from './deepReviewer';
+import { runDeepReview, RemoteFileReader } from './deepReviewer';
 import { AIKeys } from './aiBackend';
 import { ReviewPanelProvider } from './panelProvider';
 import { normalizeGitLabDiffResponse, normalizeRemoteDiff } from './diffFilter';
@@ -1136,40 +1136,122 @@ async function reviewMultiMR() {
         (activeRequirements && activeRequirements.profileId === profile.id)
           ? { ...profile, ticket_context: { raw_requirements: activeRequirements.text } }
           : profile;
-      progress.report({ message: 'Sending to AI…' });
+
+      const isDeep = extensionContext.workspaceState.get<string>('revvy.reviewScope', 'quick') === 'deep';
+
+      // ── For Deep Review: fetch head SHAs so readFile can target the PR HEAD ──
+      // This is a separate round-trip per ref (GitHub: /pulls/{n}, GitLab: /merge_requests/{iid}).
+      // Acceptable cost — Deep Review is a premium, slower feature by design.
+      let remoteReader: RemoteFileReader | undefined;
+      if (isDeep && sources.length > 0) {
+        progress.report({ message: 'Deep Review: fetching PR/MR head SHAs…' });
+
+        // Map from "owner/repo" → { type, owner, repo, sha }
+        const repoShaMap = new Map<string, { type: string; owner: string; repo: string; sha: string }>();
+
+        await Promise.allSettled(
+          refs
+            .filter(ref => !failed.includes(ref.display))
+            .map(async (ref) => {
+              try {
+                let sha: string;
+                if (ref.type === 'github') {
+                  const pr = await githubHttpClient.fetchPR(ref.owner, ref.repo, ref.number);
+                  sha = pr.head.sha;
+                } else {
+                  const projectId = ref.owner ? `${ref.owner}/${ref.repo}` : ref.repo;
+                  const mr = await gitlabHttpClient.fetchMR(projectId, ref.number);
+                  sha = mr.sha;
+                }
+                repoShaMap.set(`${ref.owner}/${ref.repo}`, {
+                  type: ref.type, owner: ref.owner, repo: ref.repo, sha,
+                });
+              } catch (err: any) {
+                console.log(`[Revvy] Deep Review: could not fetch SHA for ${ref.display}: ${err.message}`);
+              }
+            })
+        );
+
+        remoteReader = async (filePath: string, repo?: string): Promise<string> => {
+          // Resolve which repo to read from.
+          // If repo is explicitly provided, use it directly.
+          // If only one repo was reviewed, default to that one.
+          let repoKey = repo;
+          if (!repoKey) {
+            if (repoShaMap.size === 1) {
+              repoKey = repoShaMap.keys().next().value as string;
+            } else if (sources.length > 0) {
+              repoKey = sources[0].repo;
+            }
+          }
+          if (!repoKey) {
+            throw new Error(
+              'readFile: cannot determine target repo — multiple repos in review, ' +
+              'specify the "repo" field (e.g. "owner/repo")',
+            );
+          }
+          const info = repoShaMap.get(repoKey);
+          if (!info) {
+            throw new Error(`readFile: unknown repo "${repoKey}" — not part of this review`);
+          }
+          if (info.type === 'github') {
+            return githubHttpClient.readFileContent(info.owner, info.repo, filePath, info.sha);
+          } else {
+            const projectId = `${info.owner}/${info.repo}`;
+            return gitlabHttpClient.readFileContent(projectId, filePath, info.sha);
+          }
+        };
+      }
+
+      progress.report({ message: isDeep ? 'Starting Deep Review…' : 'Sending to AI…' });
       panelProvider.showLoading();
-      panelProvider.updateLoading('Analyzing changes…', 0.5);
+      panelProvider.updateLoading(isDeep ? 'Starting Deep Review…' : 'Analyzing changes…', 0.5);
 
       try {
         let tokenCount = 0;
         let lastReportedToken = 0;
         const repoCount = sources.length;
 
+        let deepLabel = isDeep ? 'Exploring repository…' : '';
+
         const onChunk = (chunk: string) => {
           tokenCount += chunk.length;
+
+          if (isDeep) {
+            // Detect "[Turn X/Y, tool Z/W: toolName]" emitted by deepReviewer on each tool call.
+            const m = chunk.match(/\[Turn (\d+)\/\d+, tool (\d+)\/(\d+): ([^\]]+)\]/);
+            if (m) {
+              deepLabel = `Exploring: ${m[4]} (tool ${m[2]}/${m[3]})`;
+              progress.report({ message: deepLabel });
+              panelProvider.patchLoading(deepLabel, Math.round(tokenCount / 4), repoCount, 0);
+              lastReportedToken = tokenCount;
+              return;
+            }
+            if (chunk.includes('Context limit reached') || chunk.includes('Tool budget reached')) {
+              deepLabel = 'Finalizing review…';
+            }
+          }
+
           if (tokenCount - lastReportedToken >= 40) {
             lastReportedToken = tokenCount;
             const approxTokens = Math.round(tokenCount / 4);
-            const label = `Generating report…`;
+            const label = isDeep ? deepLabel : 'Generating report…';
             progress.report({ message: `${label} (~${approxTokens} tokens)` });
-            // PERF: postMessage only — no HTML rebuild
             panelProvider.patchLoading(label, approxTokens, repoCount, 0);
           }
         };
 
-        // Deep Review is intentionally not supported for remote diffs: its workspace
-        // tools (readFile, searchSymbol, …) operate on the LOCAL filesystem, which
-        // has no guaranteed relation to the remote repo being reviewed.
-        // Always use Quick Review for multi-repo / remote MR reviews.
-        const result = await runReview(
-          combinedDiff,
-          profileWithReqs,
-          sources,
-          keys,
-          onChunk,
-          undefined,  // no commit rules for remote reviews (reviewer.ts already guards isRemote)
-          extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
-        );
+        const result = isDeep
+          ? await runDeepReview(combinedDiff, profileWithReqs, keys, onChunk, sources, remoteReader)
+          : await runReview(
+              combinedDiff,
+              profileWithReqs,
+              sources,
+              keys,
+              onChunk,
+              undefined,  // no commit rules for remote reviews (reviewer.ts already guards isRemote)
+              extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
+            );
 
         panelProvider.updateLoading('Done!', 1.0);
         await new Promise(r => setTimeout(r, 120));

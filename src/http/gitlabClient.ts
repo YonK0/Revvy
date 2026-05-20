@@ -23,6 +23,7 @@ export interface GitLabMR {
   target_branch:  string;
   changes_count:  string;
   web_url:        string;
+  sha:            string;   // head commit SHA of the source branch
 }
 
 export class GitLabClient extends BaseHttpClient {
@@ -93,6 +94,39 @@ export class GitLabClient extends BaseHttpClient {
     return JSON.parse(res.body);
   }
 
+  /**
+   * Like apiCall() but returns the raw response body as a string instead of
+   * parsing it as JSON.  Used for endpoints that return raw file content.
+   */
+  private async rawApiCall(path: string): Promise<string> {
+    const base  = this.getBaseUrl();
+    const ver   = this.getApiVersion();
+    const url   = `${base}/api/${ver}${path}`;
+    const token = await this.getToken();
+
+    const res = await this.request(url, {
+      headers: { 'PRIVATE-TOKEN': token },
+    });
+
+    if (res.status === 401) {
+      throw this.formatError(
+        'GitLab', url, 401, res.body,
+        'token may be invalid or expired — run "Revvy: Reset GitLab Credentials" to re-enter',
+      );
+    }
+    if (res.status === 404) {
+      throw this.formatError(
+        'GitLab', url, 404, res.body,
+        'file not found at this ref — check path and SHA',
+      );
+    }
+    if (res.status >= 400) {
+      throw this.formatError('GitLab', url, res.status, res.body);
+    }
+
+    return res.body;
+  }
+
   // ── Public API ────────────────────────────────────────────────────────────
 
   async fetchMR(projectId: string, mrIid: number): Promise<GitLabMR> {
@@ -160,5 +194,22 @@ export class GitLabClient extends BaseHttpClient {
         ? data
         : [];
     return changes;
+  }
+
+  /**
+   * Reads the raw content of a file at a specific ref (commit SHA or branch).
+   *
+   * Uses the GitLab repository files raw API:
+   *   GET /projects/{encoded-id}/repository/files/{double-encoded-path}/raw?ref={sha}
+   *
+   * Returns the raw UTF-8 text of the file.  Throws on 404 or API errors.
+   */
+  async readFileContent(projectId: string, filePath: string, ref: string): Promise<string> {
+    const encodedId   = encodeURIComponent(projectId);
+    // GitLab requires the full path to be URL-encoded (slashes → %2F)
+    const encodedPath = encodeURIComponent(filePath);
+    return this.rawApiCall(
+      `/projects/${encodedId}/repository/files/${encodedPath}/raw?ref=${encodeURIComponent(ref)}`,
+    );
   }
 }

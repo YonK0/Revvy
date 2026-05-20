@@ -10,7 +10,7 @@ export interface GitHubPR {
   number:        number;
   title:         string;
   body:          string;
-  head:          { ref: string };
+  head:          { ref: string; sha: string };
   base:          { ref: string };
   html_url:      string;
   changed_files: number;
@@ -94,5 +94,31 @@ export class GitHubClient extends BaseHttpClient {
       'application/vnd.github.v3.diff',
     );
     return body;
+  }
+
+  /**
+   * Reads the raw content of a file at a specific ref (commit SHA or branch).
+   * Uses the GitHub contents API: GET /repos/{owner}/{repo}/contents/{path}?ref={ref}
+   * Returns the decoded UTF-8 text.  Throws on 404 or unexpected response shape.
+   */
+  async readFileContent(
+    owner: string,
+    repo: string,
+    filePath: string,
+    ref: string,
+  ): Promise<string> {
+    // Encode each path segment individually so slashes are preserved as separators
+    const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
+    const { json } = await this.apiCall(
+      `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`,
+    );
+    const data = json as { content?: string; encoding?: string };
+    if (data.encoding !== 'base64' || typeof data.content !== 'string') {
+      throw new Error(
+        `readFileContent: unexpected response format for ${filePath} (encoding=${data.encoding})`,
+      );
+    }
+    // GitHub wraps base64 with newlines every 60 chars — strip them before decoding
+    return Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
   }
 }
