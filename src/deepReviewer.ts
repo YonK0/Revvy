@@ -792,6 +792,12 @@ function buildDeepUserPrompt(
     `## Response Format (JSON only, no markdown fences)\n` +
     `{"verdict":"APPROVE|REQUEST_CHANGES|NEEDS_DISCUSSION","score":1-10,"summary":"<overview>","comments":[{"file":"<file>","line":<N>,"endLine":<N>,"severity":"error|warning|suggestion","ruleId":"<ID>","ruleTitle":"<title>","message":"<120 chars>","suggestion":"<raw code, \\n joined>","codeFragment":"<verbatim 1-3 lines from diff>"}],"conclusion":"<summary>","tests":[{"title":"<Feature area — failure mode>","category":"functional|security|boundary|performance","steps":["<action>","<action>","<verification>"]}]}\n\n` +
     `## Output Rules\n` +
+    `- COVERAGE (read first): Your review MUST be a superset of a plain diff review.\n` +
+    `  First flag EVERY rule violation directly visible in the diff — exactly what a\n` +
+    `  fast non-exploratory review would catch — then ADD the deeper cross-file and\n` +
+    `  impact findings your tool exploration uncovered. Never drop a clear,\n` +
+    `  directly-visible violation just because it looks simple or because exploration\n` +
+    `  surfaced bigger issues. Check every added/removed line against every rule.\n` +
     `- "message": single sentence <120 chars\n` +
     `- "line": exact line of the violation expression\n` +
     `- "codeFragment": verbatim lines from diff that contain the violation\n` +

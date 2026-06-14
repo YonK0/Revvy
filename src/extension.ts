@@ -651,7 +651,12 @@ async function runReviewWithProgress(
               // Resolve commit-style rules once per review — never for remote reviews
               // (sources=undefined here means this is always a local diff review).
               ruleLoader?.getProfile('commit-style')?.rules.filter(r => r.enabled) ?? [],
-              extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file'),
+              // Multi-folder reviews go through a single all-in-one call so findings
+              // relate across the selected folders instead of being reviewed in
+              // isolation per file. Plain local diffs honour the user's mode toggle.
+              forceDiffContext
+                ? 'all_in_one'
+                : extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file'),
               forceDiffContext
             );
 

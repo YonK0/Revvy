@@ -950,38 +950,6 @@ body {
       </div>
     </div>
 
-    <!-- ── Network ── -->
-    <div class="cfg-card">
-      <div class="cfg-card-header">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10"/>
-          <line x1="2" y1="12" x2="22" y2="12"/>
-          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-        </svg>
-        Network
-      </div>
-      <div class="cfg-fields">
-        <div class="cfg-field">
-          <label class="cfg-label">Proxy Bypass Hosts</label>
-          <div class="cfg-input-row">
-            <input class="cfg-input" id="noproxy-hosts" type="text"
-              value="${e(cfg.noProxy)}"
-              placeholder="gitlab.corp.example.com, jira.corp.example.com" />
-            <span class="cfg-ack" id="noproxy-hosts-ack">Saved</span>
-          </div>
-          <span class="cfg-hint">Comma-separated hostnames that bypass the system proxy for direct HTTP calls</span>
-        </div>
-        <div class="cfg-field">
-          <label class="cfg-label cfg-checkbox-label">
-            <input type="checkbox" id="allow-insecure-tls" ${cfg.allowInsecureTls ? 'checked' : ''} />
-            Allow insecure TLS
-            <span class="cfg-ack" id="allow-insecure-tls-ack">Saved</span>
-          </label>
-          <span class="cfg-hint">Disable certificate verification for bypass hosts — use only if you get CERT errors with a corporate CA</span>
-        </div>
-      </div>
-    </div>
-
   </div><!-- /cfg-body -->
 
 <script>
@@ -1032,19 +1000,9 @@ body {
   watchBlur('jira-url',     'saveJiraUrl');
   watchBlur('jira-user',    'saveJiraUser');
   watchBlur('jira-token',   'saveJiraToken');
-  watchBlur('noproxy-hosts','saveNoProxy');
 
   watchChange('gitlab-api-ver', 'saveGitlabApiVer');
   watchChange('jira-api-ver',   'saveJiraApiVer');
-
-  // Checkbox — save on change
-  (function() {
-    const el = document.getElementById('allow-insecure-tls');
-    if (!el) { return; }
-    el.addEventListener('change', function() {
-      vscode.postMessage({ type: 'saveAllowInsecureTls', value: el.checked });
-    });
-  })();
 </script>
 </body>
 </html>`;
