@@ -58,6 +58,38 @@ export interface ReviewTest {
   steps: string[];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Impact analysis — driven by a team-editable YAML template synced from the
+// profiles repo (templates/ folder). The template defines the sections the AI
+// fills (e.g. Summary, Root Cause, Solution, Tests); changing the template
+// changes the output without touching the extension.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ImpactTemplateSection {
+  /** Stable JSON key the model fills (e.g. "root_cause"). */
+  key: string;
+  /** Heading shown in the panel (e.g. "Root Cause"). */
+  title: string;
+  /** Optional per-section guidance for the model. */
+  hint?: string;
+}
+
+export interface ImpactTemplate {
+  label: string;
+  instructions?: string;
+  /** Structured mode: the model returns JSON keyed by each section. */
+  sections?: ImpactTemplateSection[];
+  /** Free-form mode: the model fills this template text verbatim (e.g. a report
+   *  with "===" separators). Used when `sections` is absent. */
+  format?: string;
+}
+
+/** One filled section of the generated impact analysis. */
+export interface ImpactSection {
+  title: string;
+  content: string;
+}
+
 // Category display order: functional → boundary → performance → security
 const CATEGORY_ORDER: Record<ReviewTest['category'], number> = {
   functional:  0,
@@ -316,6 +348,8 @@ export interface ReviewResult {
    * the diff context attached to each comment rather than reading disk.
    */
   renderFromDiff?: boolean;
+  /** Impact-analysis sections, when a template is configured (filled in order). */
+  impactAnalysis?: ImpactSection[];
   /** Deep Review only: number of workspace tool calls executed in the agent loop. */
   toolCallsUsed?: number;
 }
@@ -1092,6 +1126,80 @@ async function generateTests(
   } catch (e: any) {
     console.log(`[Revvy] generateTests failed: ${e.message}`);
     return { value: [] };
+  }
+}
+
+/**
+ * Generate an impact analysis for a diff using a team-editable template.
+ * The template's sections define the JSON the model returns and the headings
+ * shown in the panel; editing the template (in the profiles repo) changes the
+ * output with no code change. Standalone and engine-agnostic — works the same
+ * after Quick or Deep review. Returns sections in template order, empties dropped.
+ */
+export async function generateImpactAnalysis(
+  diff: string,
+  template: ImpactTemplate,
+  keys: AIKeys,
+  onChunk?: StreamChunkCallback,
+): Promise<ImpactSection[]> {
+  // Free-form mode: the template is a block of text (e.g. with "===" separators)
+  // the model fills in and returns verbatim as a single section.
+  if ((!template.sections || template.sections.length === 0) && template.format && template.format.trim()) {
+    const systemPrompt =
+      `You are a senior engineer writing an impact analysis for a code change.\n` +
+      (template.instructions ? template.instructions.trim() + '\n' : '') +
+      `Fill in the report template below using the diff. Keep its structure, ` +
+      `headings and separators EXACTLY; replace each blank with concrete content ` +
+      `grounded in the diff. Return ONLY the filled template as plain text — no ` +
+      `JSON, no markdown fences.\n\nTEMPLATE:\n${template.format}`;
+    const userPrompt = `Diff to analyse:\n\n\`\`\`diff\n${diff}\n\`\`\``;
+    try {
+      const aiResp = await callAI(userPrompt, systemPrompt, keys, onChunk);
+      const content = aiResp.text.replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/i, '').trim();
+      return content ? [{ title: template.label || 'Impact Analysis', content }] : [];
+    } catch (e: any) {
+      console.log(`[Revvy] generateImpactAnalysis (freeform) failed: ${e.message}`);
+      return [];
+    }
+  }
+
+  if (!template.sections || template.sections.length === 0) { return []; }
+
+  const sectionList = template.sections
+    .map(s => `- "${s.key}": ${s.title}${s.hint ? ' — ' + s.hint : ''}`)
+    .join('\n');
+  const schemaKeys = template.sections.map(s => `"${s.key}":"<text>"`).join(',');
+
+  const systemPrompt =
+    `You are a senior engineer writing an impact analysis for a code change.\n` +
+    (template.instructions ? template.instructions.trim() + '\n' : '') +
+    `Return ONLY valid JSON: {"impact_analysis":{${schemaKeys}}}\n` +
+    `Fill each section concisely and concretely, grounded in the diff. ` +
+    `Leave a section as an empty string only if it genuinely does not apply.\n` +
+    `Sections:\n${sectionList}`;
+
+  const userPrompt =
+    `Analyse the impact of this diff.\n\n\`\`\`diff\n${diff}\n\`\`\`\n\n` +
+    `Return only the JSON object with the "impact_analysis" field.`;
+
+  try {
+    const aiResp = await callAI(userPrompt, systemPrompt, keys, onChunk);
+    const clean = aiResp.text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) { return []; }
+    const parsed = JSON.parse(jsonMatch[0]);
+    const obj = (parsed.impact_analysis && typeof parsed.impact_analysis === 'object')
+      ? parsed.impact_analysis
+      : parsed;
+    return template.sections
+      .map(s => ({
+        title: s.title,
+        content: typeof obj[s.key] === 'string' ? obj[s.key].trim() : '',
+      }))
+      .filter(s => s.content.length > 0);
+  } catch (e: any) {
+    console.log(`[Revvy] generateImpactAnalysis failed: ${e.message}`);
+    return [];
   }
 }
 
