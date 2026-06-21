@@ -1,7 +1,7 @@
 // src/panelProvider.ts
 // WebView panel for displaying review results — Figma design integration
 
-import { ReviewResult, ReviewComment, ReviewTest, ReviewSource } from './reviewer';
+import { ReviewResult, ReviewComment, ReviewTest, ReviewSource, ImpactSection } from './reviewer';
 import * as vscode from 'vscode';
 
 export class ReviewPanelProvider implements vscode.WebviewViewProvider {
@@ -35,6 +35,15 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
         case 'reviewMultiMR':
           vscode.commands.executeCommand('revvy.reviewMultiMR');
           break;
+        case 'requestProfileBadge': {
+          type Badge = { label?: string; version?: string; syncedFrom?: string; repoLinked?: boolean };
+          let badge: Badge = {};
+          try {
+            badge = (await vscode.commands.executeCommand<Badge>('revvy.getProfileBadge')) ?? {};
+          } catch { /* loader not ready — render what we have */ }
+          webviewView.webview.postMessage({ type: 'profileBadge', badge });
+          break;
+        }
         case 'requestFolders': {
           try {
             const folders = (await vscode.commands.executeCommand<Array<{ path: string; name: string; depth: number }>>('revvy.listGitFolders')) ?? [];
@@ -110,6 +119,28 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
         // ── Configuration screen ──────────────────────────────────────────────
         case 'openConfigure':
           await this.showConfigure();
+          break;
+
+        case 'saveProfilesRepoUrl':
+          await vscode.workspace.getConfiguration('revvy.profiles')
+            .update('repoUrl', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'profiles-repo-url' });
+          break;
+
+        case 'saveProfilesRef':
+          await vscode.workspace.getConfiguration('revvy.profiles')
+            .update('ref', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'profiles-ref' });
+          break;
+
+        case 'saveProfilesPath':
+          await vscode.workspace.getConfiguration('revvy.profiles')
+            .update('path', msg.value, vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'profiles-path' });
+          break;
+
+        case 'syncProfiles':
+          vscode.commands.executeCommand('revvy.syncProfiles');
           break;
 
         case 'saveGitlabUrl':
@@ -319,6 +350,13 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
 
     if (r.summary) {
       md += `## Summary\n\n${r.summary}\n\n`;
+    }
+
+    if (r.impactAnalysis && r.impactAnalysis.length > 0) {
+      md += `---\n\n## Impact Analysis\n\n`;
+      for (const s of r.impactAnalysis) {
+        md += `### ${s.title}\n\n${s.content}\n\n`;
+      }
     }
 
     if (r.comments.length > 0) {
@@ -699,9 +737,13 @@ body {
     const hasGithubToken = !!(await this.context.secrets.get('revvy.github.token'));
     const hasJiraUser    = !!(await this.context.secrets.get('revvy.jira.user'));
     const hasJiraToken   = !!(await this.context.secrets.get('revvy.jira.token'));
+    const profilesRepoUrl = vscode.workspace.getConfiguration('revvy.profiles').get<string>('repoUrl', '');
+    const profilesRef     = vscode.workspace.getConfiguration('revvy.profiles').get<string>('ref', 'main');
+    const profilesPath    = vscode.workspace.getConfiguration('revvy.profiles').get<string>('path', '');
     this._view.webview.html = this.getConfigureHtml({
       gitlabUrl, gitlabApiVer, githubUrl, jiraUrl, jiraApiVer, noProxy, allowInsecureTls,
       hasGitlabToken, hasGithubToken, hasJiraUser, hasJiraToken,
+      profilesRepoUrl, profilesRef, profilesPath,
     });
   }
 
@@ -717,6 +759,9 @@ body {
     hasGithubToken: boolean;
     hasJiraUser: boolean;
     hasJiraToken: boolean;
+    profilesRepoUrl: string;
+    profilesRef: string;
+    profilesPath: string;
   }): string {
     const e = (s: string) => this.escapeHtml(s);
     const tokenPlaceholder = (has: boolean, hint: string) =>
@@ -827,6 +872,51 @@ body {
   </div>
 
   <div class="cfg-body">
+
+    <!-- ── Team Profiles (GitLab repo) ── -->
+    <div class="cfg-card">
+      <div class="cfg-card-header">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>
+        </svg>
+        Team Profiles
+      </div>
+      <div class="cfg-fields">
+        <div class="cfg-field">
+          <label class="cfg-label">Profiles Repo URL</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="profiles-repo-url" type="url"
+              value="${e(cfg.profilesRepoUrl)}"
+              placeholder="https://gitlab.com/org/revvy-profiles" />
+            <span class="cfg-ack" id="profiles-repo-url-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">GitLab repo of YAML profiles. When set, profiles sync from here instead of a local folder. Private repos use your saved GitLab token.</span>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">Ref (branch or tag)</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="profiles-ref" type="text"
+              value="${e(cfg.profilesRef)}"
+              placeholder="main" />
+            <span class="cfg-ack" id="profiles-ref-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Pin a tag (e.g. v2.3.0) for reproducible reviews, or track a branch.</span>
+        </div>
+        <div class="cfg-field">
+          <label class="cfg-label">Subfolder (optional)</label>
+          <div class="cfg-input-row">
+            <input class="cfg-input" id="profiles-path" type="text"
+              value="${e(cfg.profilesPath)}"
+              placeholder="profiles" />
+            <span class="cfg-ack" id="profiles-path-ack">Saved</span>
+          </div>
+          <span class="cfg-hint">Folder in the repo holding the .yaml files. Leave empty for the repo root.</span>
+        </div>
+        <button class="btn-primary" id="profiles-sync-btn" onclick="vscode.postMessage({type:'syncProfiles'})" style="margin-top:4px">
+          Sync profiles now
+        </button>
+      </div>
+    </div>
 
     <!-- ── GitLab ── -->
     <div class="cfg-card">
@@ -993,6 +1083,9 @@ body {
     });
   }
 
+  watchBlur('profiles-repo-url', 'saveProfilesRepoUrl');
+  watchBlur('profiles-ref',      'saveProfilesRef');
+  watchBlur('profiles-path',     'saveProfilesPath');
   watchBlur('gitlab-url',   'saveGitlabUrl');
   watchBlur('gitlab-token', 'saveGitlabToken');
   watchBlur('github-url',   'saveGithubUrl');
@@ -1013,9 +1106,11 @@ body {
     requirementsActive = false,
     requirementsLabel = ''
   ): string {
-    const profile = vscode.workspace.getConfiguration('revvy').get<string>('activeProfile', 'c-embedded');
     const revvyCfg       = vscode.workspace.getConfiguration('revvy');
     const maxAgentRounds = revvyCfg.get<number>('deepReview.maxAgentRounds', 30);
+    // Team mode = profiles come from a remote repo. Swaps the local "Open Rules
+    // Folder" / "Reload Rules" actions for a single "Sync Rules" (fetch latest).
+    const teamMode = !!vscode.workspace.getConfiguration('revvy.profiles').get<string>('repoUrl', '').trim();
     const logoPngUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'resources', 'home_icon.png')
     ).toString();
@@ -1139,8 +1234,9 @@ body {
         <div class="hero-sub">AI-powered code review for your team.</div>
         <div class="profile-chip">
           <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M6 20v-2a6 6 0 0 1 12 0v2"/></svg>
-          Profile: <span>${this.escapeHtml(profile)}</span>
+          Profile: <span id="profileName" style="color:var(--fg-muted)">…</span><span id="profileVersion" style="color:var(--fg-subtle)"></span>
         </div>
+        <div id="syncedFrom" style="display:none;align-items:center;gap:4px;font-size:10px;color:var(--fg-subtle);margin:-12px 0 14px;font-family:var(--font-mono)"></div>
       </div>
 
       <!-- Secondary actions -->
@@ -1148,12 +1244,19 @@ body {
         <button class="btn-secondary" onclick="vscode.postMessage({type:'selectProfile'})">
           ${this.icons.settings}<span>Switch Profile</span>
         </button>
+        ${teamMode ? `
+        <button class="btn-secondary" onclick="vscode.postMessage({type:'syncProfiles'})">
+          ${this.icons.refreshCw}<span>Sync Rules</span>
+          <span class="label-right">from repo</span>
+        </button>
+        ` : `
         <button class="btn-secondary" onclick="vscode.postMessage({type:'openRules'})">
           ${this.icons.folderOpen}<span>Open Rules Folder</span>
         </button>
         <button class="btn-secondary" onclick="vscode.postMessage({type:'reloadRules'})">
           ${this.icons.refreshCw}<span>Reload Rules</span>
         </button>
+        `}
         ${requirementsActive ? `
         <button class="btn-secondary btn-req-active" onclick="vscode.postMessage({type:'setTicket'})">
           ${this.icons.clipboard}<span>Set Requirements</span>
@@ -1336,6 +1439,27 @@ body {
         list.dataset.loaded = '1';
         list.dataset.open = '1';
       }
+      if (msg.type === 'profileBadge') {
+        const b = msg.badge || {};
+        const nameEl = document.getElementById('profileName');
+        const verEl  = document.getElementById('profileVersion');
+        const sfEl   = document.getElementById('syncedFrom');
+        if (nameEl) {
+          if (b.label) { nameEl.textContent = b.label; }
+          else if (b.repoLinked) { nameEl.textContent = 'not synced — run Sync'; }
+          else { nameEl.textContent = 'no profile loaded'; }
+        }
+        if (verEl) { verEl.textContent = b.version ? '  ·  v' + b.version : ''; }
+        if (sfEl) {
+          if (b.syncedFrom) {
+            sfEl.textContent = '⤓ ' + b.syncedFrom;
+            sfEl.title = b.syncedFrom;
+            sfEl.style.display = 'flex';
+          } else {
+            sfEl.style.display = 'none';
+          }
+        }
+      }
       if (msg.type === 'updateModels') {
         const sel = document.getElementById('modelSelect');
         if (!sel) return;
@@ -1370,6 +1494,7 @@ body {
       }
     });
     vscode.postMessage({ type: 'requestModels' });
+    vscode.postMessage({ type: 'requestProfileBadge' });
     (function setupModeToggle() {
       const pfb = document.getElementById('mode-per-file');
       const aiob = document.getElementById('mode-all-in-one');
@@ -1749,12 +1874,11 @@ body {
     const profileShort = this.escapeHtml(r.profileUsed);
     const modelShort   = this.escapeHtml(r.modelUsed.split('/').pop() ?? r.modelUsed);
 
-    // Cost footer: total tokens + estimated GitHub AI credits.
-    const totalTokens = (r.estimatedInputTokens ?? 0) + (r.estimatedOutputTokens ?? 0);
-    const credits     = this.estimateCredits(r);
-    const tokenFooter = totalTokens > 0 ? ` &middot; ~${totalTokens.toLocaleString()} tokens` : '';
+    // Cost footer: estimated GitHub AI credits only (token count is an internal
+    // estimate and was misleading, so it's no longer shown).
+    const credits      = this.estimateCredits(r);
     const creditFooter = credits !== undefined
-      ? ` &middot; <span title="Estimated GitHub AI credit cost (1 credit = $0.01), from ~${(r.estimatedInputTokens ?? 0).toLocaleString()} input + ${(r.estimatedOutputTokens ?? 0).toLocaleString()} output tokens at the per-model rates in settings (revvy.cost.*). Authoritative usage is in your GitHub usage dashboard." style="cursor:help">≈ ${this.formatCredits(credits)} credits</span>`
+      ? ` &middot; <span title="Estimated GitHub AI credit cost (1 credit = $0.01), from this review's tokens at the per-model rates in settings (revvy.cost.*). Approximate — authoritative usage is in your GitHub usage dashboard." style="cursor:help">≈ ${this.formatCredits(credits)} credits</span>`
       : '';
 
     // Render snippets from the diff (not disk) when the diff doesn't match the
@@ -2200,6 +2324,9 @@ body {
     </div>
     `}
 
+    <!-- Impact Analysis (when a template is configured) -->
+    ${this.renderImpactAnalysisHtml(r.impactAnalysis ?? [])}
+
     <!-- Tests -->
     ${this.renderTestsHtml(r.tests)}
 
@@ -2221,7 +2348,7 @@ body {
         ${this.icons.copyClipboard}<span>Copy MD</span>
       </button>
     </div>
-    <div class="meta-footer">${this.escapeHtml(r.backendUsed)} &middot; ${(r.durationMs / 1000).toFixed(1)}s${r.toolCallsUsed ? ` &middot; ${r.toolCallsUsed} tool calls` : ''}${tokenFooter}${creditFooter}</div>
+    <div class="meta-footer">${this.escapeHtml(r.backendUsed)} &middot; ${(r.durationMs / 1000).toFixed(1)}s${r.toolCallsUsed ? ` &middot; ${r.toolCallsUsed} tool calls` : ''}${creditFooter}</div>
       </div>
 
 <script>
@@ -2277,6 +2404,31 @@ body {
       <div class="sources-banner">
         <div class="sources-banner-label">Reviewing ${sources.length} repositories</div>
         <div>${chips}</div>
+      </div>`;
+  }
+
+  private renderImpactAnalysisHtml(sections: ImpactSection[]): string {
+    if (!sections || sections.length === 0) { return ''; }
+
+    const items = sections.map(s => `
+        <div style="margin-bottom:10px">
+          <div style="font-size:11px;font-weight:700;color:var(--accent-fg);margin-bottom:3px">${this.escapeHtml(s.title)}</div>
+          <div style="font-size:12px;color:var(--fg-default);line-height:1.6;white-space:pre-wrap;word-break:break-word">${this.escapeHtml(s.content)}</div>
+        </div>`).join('');
+
+    const bodyId = 'impact-body';
+    // Expanded by default — it's the headline narrative of the review.
+    return `
+      <div style="margin:10px 10px 10px;background:var(--bg-overlay);border:1px solid var(--border-default);border-radius:8px;overflow:hidden">
+        <button onclick="toggleFix('${bodyId}',this)" style="width:100%;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:transparent;border:none;cursor:pointer;font-family:var(--font-sans)">
+          <div style="display:flex;align-items:center;gap:6px">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-fg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="m4.93 4.93 2.83 2.83"/><path d="m16.24 16.24 2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/></svg>
+            <span style="font-size:11px;font-weight:600;color:var(--accent-fg)">Impact Analysis</span>
+            <span style="font-size:10px;color:var(--fg-subtle);font-weight:400">${sections.length}</span>
+          </div>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--fg-subtle)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.15s"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div id="${bodyId}" style="border-top:1px solid var(--border-default);padding:10px 12px">${items}</div>
       </div>`;
   }
 

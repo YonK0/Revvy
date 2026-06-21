@@ -8,12 +8,13 @@ import * as yaml from 'js-yaml';
 import { execSync, execFileSync, exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { RuleLoader, ReviewProfile } from './ruleLoader';
-import { runReview, autoDetectProfile, ReviewSource } from './reviewer';
+import { runReview, autoDetectProfile, ReviewSource, generateImpactAnalysis } from './reviewer';
 import { runDeepReview, RemoteFileReader } from './deepReviewer';
 import { AIKeys } from './aiBackend';
 import { ReviewPanelProvider } from './panelProvider';
 import { normalizeGitLabDiffResponse, normalizeRemoteDiff } from './diffFilter';
 import { Credentials } from './http/credentials';
+import { resolveProfilesRepo, getProfilesCacheDir, syncProfiles, loadImpactTemplate } from './profileSync';
 import { GitLabClient } from './http/gitlabClient';
 import { GitHubClient } from './http/githubClient';
 import { JiraClient } from './http/jiraClient';
@@ -25,6 +26,10 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 let ruleLoader: RuleLoader | undefined;
+// Active YAML watcher for the rules path. Disposed/re-registered when the loader
+// is rebuilt (e.g. after switching to a remote profiles repo) so we don't leak
+// watchers or keep one pointed at a stale path.
+let rulesWatcher: vscode.Disposable | undefined;
 let panelProvider: ReviewPanelProvider;
 let extensionContext: vscode.ExtensionContext;
 
@@ -208,6 +213,47 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.syncProfiles', async () => {
+      await syncProfilesAndReload();
+    })
+  );
+
+  // Lightweight badge data for the home panel: active profile label/version and,
+  // in team mode, the "org/repo@ref" the profiles were synced from. No side
+  // effects (does not trigger a load/sync) — uses whatever is already loaded.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.getProfileBadge', async (): Promise<{
+      label?: string; version?: string; syncedFrom?: string; repoLinked: boolean;
+    }> => {
+      const repo = resolveProfilesRepo();
+      // Team mode: make sure already-synced profiles are loaded (from cache, no
+      // network) so the badge reflects them even on a fresh panel open — but
+      // never trigger a fresh sync here (that's the Sync action's job).
+      if (repo && !ruleLoader) {
+        try {
+          const cacheDir = getProfilesCacheDir(extensionContext, repo);
+          const hasCache = fs.existsSync(cacheDir)
+            && fs.readdirSync(cacheDir).some(f => /\.ya?ml$/i.test(f));
+          if (hasCache) { await ensureRuleLoader(); }
+        } catch { /* ignore — show the unsynced state */ }
+      }
+      // Resolve the active profile; fall back to the first real profile so a
+      // stale/default activeProfile id never blanks the badge after a sync.
+      const activeId = vscode.workspace.getConfiguration('revvy').get<string>('activeProfile', '');
+      const profiles = ruleLoader?.getAllProfiles() ?? [];
+      const profile = (activeId ? ruleLoader?.getProfile(activeId) : undefined)
+        ?? profiles.find(p => p.id !== 'commit-style')
+        ?? profiles[0];
+      return {
+        label: profile?.label,
+        version: profile?.metadata?.version,
+        syncedFrom: repo ? `${repo.project}@${repo.ref}` : undefined,
+        repoLinked: !!repo,
+      };
+    })
+  );
+
   // Rules are loaded lazily on first command/panel use via ensureRuleLoader().
   // No eager disk I/O or file watchers at activation time — keeps startup cost zero.
 }
@@ -220,30 +266,65 @@ async function ensureRuleLoader(): Promise<RuleLoader | undefined> {
   if (ruleLoader) { return ruleLoader; }
 
   try {
+    const repoCfg = resolveProfilesRepo();
     const rulesPath = getRulesPath();
+
+    // Team mode: sync profiles from the repo on first load if the cache is empty.
+    if (repoCfg) {
+      const hasCache = fs.existsSync(rulesPath)
+        && fs.readdirSync(rulesPath).some(f => /\.ya?ml$/i.test(f));
+      if (!hasCache) {
+        try {
+          const r = await syncProfiles(extensionContext, credentials);
+          vscode.window.showInformationMessage(
+            `Revvy: synced ${r.count} profile(s)` +
+            `${r.templateCount ? ` and ${r.templateCount} template(s)` : ''} ` +
+            `from ${r.project}@${r.ref}.`
+          );
+        } catch (e: any) {
+          vscode.window.showWarningMessage(
+            `Revvy: could not sync profiles from the repo (${e.message}). ` +
+            `Run "Revvy: Sync Profiles from Repo" once connectivity/credentials are available.`
+          );
+        }
+      }
+    }
+
     ruleLoader = new RuleLoader(rulesPath, msg => console.log('[RuleLoader]', msg));
     await ruleLoader.loadAll();
-    // One-time migration: strip any ticket_context persisted by older extension versions.
-    // Requirements are now session-only (in-memory); on-disk ticket_context is legacy.
-    for (const p of ruleLoader.getAllProfiles()) {
-      const yamlPath = path.join(rulesPath, `${p.id}.yaml`);
-      try {
-        const content = fs.readFileSync(yamlPath, 'utf8');
-        const data = yaml.load(content) as any;
-        if (data?.profile?.ticket_context) {
-          delete data.profile.ticket_context;
-          fs.writeFileSync(yamlPath, yaml.dump(data));
-        }
-      } catch { /* ignore files we can't touch */ }
+    // One-time migration: strip any ticket_context persisted by older extension
+    // versions. Only applies to the local workspace folder — the synced team
+    // cache is read-only/regenerated, so we skip it in team mode.
+    if (!repoCfg) {
+      for (const p of ruleLoader.getAllProfiles()) {
+        const yamlPath = path.join(rulesPath, `${p.id}.yaml`);
+        try {
+          const content = fs.readFileSync(yamlPath, 'utf8');
+          const data = yaml.load(content) as any;
+          if (data?.profile?.ticket_context) {
+            delete data.profile.ticket_context;
+            fs.writeFileSync(yamlPath, yaml.dump(data));
+          }
+        } catch { /* ignore files we can't touch */ }
+      }
     }
+
+    // Team mode: the default activeProfile ("c-embedded") usually doesn't exist
+    // in a team's remote set, which would leave the panel/reviews pointing at a
+    // missing profile. Auto-select the first real profile so it "just works"
+    // after sync (skipping the commit-style helper profile).
+    if (repoCfg) {
+      await autoSelectProfileIfMissing();
+    }
+
     // Start the YAML watcher now that the loader is initialised.
     // We only do this once (guarded by the `if (ruleLoader)` check above).
-    extensionContext.subscriptions.push(
-      ruleLoader.watchForChanges(async () => {
-        await ruleLoader!.loadAll();
-        vscode.window.showInformationMessage('Rules reloaded from YAML');
-      })
-    );
+    rulesWatcher?.dispose();
+    rulesWatcher = ruleLoader.watchForChanges(async () => {
+      await ruleLoader!.loadAll();
+      vscode.window.showInformationMessage('Rules reloaded from YAML');
+    });
+    extensionContext.subscriptions.push(rulesWatcher);
     return ruleLoader;
   } catch (err: any) {
     vscode.window.showErrorMessage(`Revvy: ${err.message}`);
@@ -251,19 +332,81 @@ async function ensureRuleLoader(): Promise<RuleLoader | undefined> {
   }
 }
 
+/**
+ * If the configured active profile isn't among the loaded profiles (common right
+ * after switching to a remote repo, where the default "c-embedded" is absent),
+ * select the first real profile so the panel badge and reviews resolve. No-op
+ * when the active profile already exists or none are loaded.
+ */
+async function autoSelectProfileIfMissing(): Promise<void> {
+  const profiles = ruleLoader?.getAllProfiles() ?? [];
+  if (profiles.length === 0) { return; }
+  const cfg = vscode.workspace.getConfiguration('revvy');
+  const activeId = cfg.get<string>('activeProfile', '');
+  if (activeId && profiles.some(p => p.id === activeId)) { return; }
+  const pick = profiles.find(p => p.id !== 'commit-style') ?? profiles[0];
+  await cfg.update('activeProfile', pick.id, vscode.ConfigurationTarget.Global);
+}
+
+/**
+ * Pull the latest profiles from the configured GitLab repo, reload them, and
+ * refresh the home panel. Invoked by the "Revvy: Sync Profiles from Repo"
+ * command and the Configuration panel's "Sync now" button.
+ */
+async function syncProfilesAndReload(): Promise<void> {
+  const repoCfg = resolveProfilesRepo();
+  if (!repoCfg) {
+    vscode.window.showWarningMessage(
+      'Revvy: set a profiles repository first (Configuration → Profiles, or revvy.profiles.repoUrl).'
+    );
+    return;
+  }
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'Revvy: syncing profiles…' },
+    async () => {
+      try {
+        const r = await syncProfiles(extensionContext, credentials);
+        // Rebuild the loader so it points at the current cache dir (the repo/ref
+        // may have changed since the loader was first created) and reflects the
+        // freshly-synced profiles.
+        ruleLoader = undefined;
+        await ensureRuleLoader();
+        vscode.window.showInformationMessage(
+          `Revvy: synced ${r.count} profile(s)` +
+          `${r.templateCount ? ` and ${r.templateCount} template(s)` : ' (no templates found)'} ` +
+          `from ${r.project}@${r.ref}.`
+        );
+        const label = activeRequirements ? buildRequirementsLabel(activeRequirements.text) : '';
+        panelProvider.showWelcome(!!activeRequirements, label);
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Revvy: profile sync failed — ${e.message}`);
+      }
+    }
+  );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
 function getRulesPath(): string {
+  // Team mode: when a profiles repo is configured, profiles live in the synced
+  // cache (under global storage) — no .vscode-reviewer folder, no workspace needed.
+  const repo = resolveProfilesRepo();
+  if (repo) {
+    return getProfilesCacheDir(extensionContext, repo);
+  }
+
+  // Legacy local mode: .vscode-reviewer/profiles in the open workspace.
   const config = vscode.workspace.getConfiguration('revvy');
   const relativePath = config.get<string>('rulesPath', '.vscode-reviewer/profiles');
-  
+
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
     throw new Error('No workspace folder open');
   }
-  
+
   return path.join(folders[0].uri.fsPath, relativePath);
 }
 
@@ -659,6 +802,20 @@ async function runReviewWithProgress(
                 : extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file'),
               forceDiffContext
             );
+
+        // Impact analysis — engine-agnostic extra pass driven by the team's
+        // editable template (templates/ in the profiles repo). Runs the same
+        // after Quick or Deep. Non-fatal: a failure never sinks the review.
+        const impactTemplate = loadImpactTemplate(extensionContext);
+        if (impactTemplate) {
+          progress.report({ message: 'Generating impact analysis…' });
+          panelProvider.updateLoading('Generating impact analysis…', 0.9);
+          try {
+            result.impactAnalysis = await generateImpactAnalysis(diff, impactTemplate, keys);
+          } catch (e: any) {
+            console.log(`[Revvy] impact analysis skipped: ${e?.message ?? e}`);
+          }
+        }
 
         if (result.filterStats && result.filterStats.skippedFiles > 0) {
           console.log(
