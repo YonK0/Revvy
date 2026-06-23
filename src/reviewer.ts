@@ -634,7 +634,7 @@ function buildSystemPrompt(
   sources?: ReviewSource[],
   repoContext?: string,
   commitRules?: ReviewRule[],
-  options?: { includeTests?: boolean }
+  options?: { includeTests?: boolean; components?: string[] }
 ): string {
   // Tests are included inline by default. The parallel per-file path sets this
   // false and generates tests once for the whole changeset via generateTests().
@@ -674,6 +674,20 @@ function buildSystemPrompt(
       `  - ${s.type.toUpperCase()} ${s.type === 'gitlab' ? 'MR' : 'PR'} #${s.mrNumber} — ${s.repo}`
     ).join('\n');
     multiRepoSection = `\n## Multi-Repo Review (${sources.length} repos)\n${sourceList}\nFile format: "repo/filename". Flag cross-repo API mismatches, version conflicts, shared protocol breaks.\n`;
+  }
+
+  // Cross-component guidance for a combined multi-folder review: steer the model
+  // to reason ACROSS the folders, not just file-by-file.
+  let multiComponentSection = '';
+  if (options?.components && options.components.length > 1) {
+    multiComponentSection =
+      `\n## Multi-Component Review (${options.components.length} components: ${options.components.join(', ')})\n` +
+      `Each file path is prefixed with its component folder. Beyond reviewing each change on its own, reason ACROSS components:\n` +
+      `- Trace changed shared symbols/APIs/types from one component to callers in the others; flag signature, contract, or return-value mismatches.\n` +
+      `- Flag protocol, message-format, opcode, or data-layout changes in one component not mirrored in the others that depend on it.\n` +
+      `- Flag a change in one component that REQUIRES a matching change in another which is missing from this diff.\n` +
+      `- Flag version/build/configuration coupling that spans components.\n` +
+      `When a finding is cross-component, name both components in the message.\n`;
   }
 
   const repoContextSection = repoContext ?? '';
@@ -719,7 +733,7 @@ ${rulesTable}
 - Score harshly: 7-8=acceptable, 5-6=needs work, 3-4=significant issues, 1-2=major problems
 - No praise, focus on problems only
 - Reference rule ID in every comment
-${includeTests ? TEST_INSTRUCTIONS + '\n' : ''}${ticketSection}${multiRepoSection}${repoContextSection ? '\n' + repoContextSection : ''}${commitMsgSection}`;
+${includeTests ? TEST_INSTRUCTIONS + '\n' : ''}${ticketSection}${multiRepoSection}${multiComponentSection}${repoContextSection ? '\n' + repoContextSection : ''}${commitMsgSection}`;
 }
 
 function buildUserPrompt(diff: string, options?: { allInOne?: boolean }): string {
@@ -1228,7 +1242,10 @@ export async function runReview(
   // Code context is then sourced from the diff itself rather than disk, the
   // disk-based cross-file search is skipped, and commit messages are not
   // generated. The panel renders snippets from the diff via result.renderFromDiff.
-  contextFromDiff = false
+  contextFromDiff = false,
+  // Component folder names for a combined multi-folder review — adds explicit
+  // cross-component guidance to the prompt when more than one is present.
+  components?: string[]
 ): Promise<ReviewResult> {
   if (!diff.trim()) {
     throw new Error('No diff to review');
@@ -1287,7 +1304,7 @@ export async function runReview(
     // prompt carries the cross-repo integration context.
     // Tests-once: omit the test-generation block from per-file prompts — tests
     // are generated in a single consolidated call after the fan-out.
-    const systemPromptBase = buildSystemPrompt(profile, sources, '', undefined, { includeTests: false });
+    const systemPromptBase = buildSystemPrompt(profile, sources, '', undefined, { includeTests: false, components });
 
     let sharedFileCache: Map<string, string> = new Map();
     if (!useDiffContext) {
@@ -1394,7 +1411,8 @@ export async function runReview(
       // Pass commitRules only for working-tree local reviews so the AI generates
       // commit messages in the same call — zero extra round-trip cost. Skipped
       // for remote MRs and multi-branch reviews (no single commit context).
-      !useDiffContext ? commitRules : undefined
+      !useDiffContext ? commitRules : undefined,
+      { components }
     );
     // Use the multi-file all-in-one prompt when mode is 'all_in_one' and the diff
     // spans more than one file — instructs the AI to attribute findings by file path.

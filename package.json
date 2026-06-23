@@ -2,7 +2,7 @@
   "name": "revvy-reviewer",
   "displayName": "Revvy AI Reviewer",
   "description": "AI-powered code review extension with YAML-configurable rule profiles. Supports GitHub Copilot, OpenAI, and Anthropic. Built for teams and enterprises.",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "publisher": "YonK0",
   "license": "MIT",
   "repository": {
@@ -54,7 +54,8 @@
     "onCommand:revvy.resetGitlabCredentials",
     "onCommand:revvy.resetGithubCredentials",
     "onCommand:revvy.resetJiraCredentials",
-    "onCommand:revvy.openConfigure"
+    "onCommand:revvy.openConfigure",
+    "onCommand:revvy.syncProfiles"
   ],
   "main": "./out/extension.js",
   "icon": "resources/icon.png",
@@ -132,6 +133,11 @@
       {
         "command": "revvy.openConfigure",
         "title": "Revvy: Open Configuration"
+      },
+      {
+        "command": "revvy.syncProfiles",
+        "title": "Revvy: Sync Profiles from Repo",
+        "icon": "$(cloud-download)"
       }
     ],
     "viewsContainers": {
@@ -256,6 +262,26 @@
           "type": "number",
           "default": 600000,
           "description": "Deep Review: cancel a round if the model produces no stream activity within this many milliseconds (default 600000 = 10 min). Prevents the agent loop from hanging indefinitely on a slow or stalled Copilot response."
+        },
+        "revvy.profiles.repoUrl": {
+          "type": "string",
+          "default": "",
+          "description": "GitLab repository holding the team's review profiles, e.g. https://gitlab.com/org/revvy-profiles. When set, profiles are synced from this repo instead of the local .vscode-reviewer/profiles folder. Leave empty to use local profiles."
+        },
+        "revvy.profiles.ref": {
+          "type": "string",
+          "default": "main",
+          "description": "Branch or tag of the profiles repo to read. Pin a tag (e.g. v2.3.0) for reproducible reviews, or track a branch (e.g. main) for the latest."
+        },
+        "revvy.profiles.path": {
+          "type": "string",
+          "default": "",
+          "description": "Subfolder in the profiles repo that contains the YAML profile files (e.g. profiles). Leave empty for the repo root."
+        },
+        "revvy.profiles.templatesPath": {
+          "type": "string",
+          "default": "templates",
+          "description": "Subfolder in the profiles repo that holds the impact-analysis template (YAML with sections, or a plain .txt/.md report layout the AI fills in). Synced alongside profiles. Leave empty to disable templates."
         }
       }
     },

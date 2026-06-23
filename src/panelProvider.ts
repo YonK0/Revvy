@@ -717,6 +717,16 @@ body {
     }
   }
 
+  /**
+   * Push an updated profile badge to the already-rendered home panel without
+   * rebuilding the HTML. Needed because the welcome HTML is byte-identical
+   * across profiles (the name/version are filled by JS), so re-assigning it
+   * after a profile switch / sync wouldn't re-trigger the badge fetch.
+   */
+  public refreshProfileBadge(badge: { label?: string; version?: string; syncedFrom?: string; repoLinked?: boolean }) {
+    this._view?.webview.postMessage({ type: 'profileBadge', badge });
+  }
+
   // ──────────────────────────────────────────────────────────
   // Configuration Screen
   // ──────────────────────────────────────────────────────────

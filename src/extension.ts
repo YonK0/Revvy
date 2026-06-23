@@ -379,6 +379,7 @@ async function syncProfilesAndReload(): Promise<void> {
         );
         const label = activeRequirements ? buildRequirementsLabel(activeRequirements.text) : '';
         panelProvider.showWelcome(!!activeRequirements, label);
+        await refreshProfileBadge();
       } catch (e: any) {
         vscode.window.showErrorMessage(`Revvy: profile sync failed — ${e.message}`);
       }
@@ -596,18 +597,26 @@ function findGitRepos(root: string): RepoNode[] {
 async function getCombinedFolderDiff(root: string, relPaths: string[]): Promise<string> {
   const parts = await Promise.all(
     relPaths.map(async rel => {
-      const dir    = rel === '.' ? root : path.join(root, rel);
-      const prefix = rel === '.' ? path.basename(root) : rel;
+      const dir = rel === '.' ? root : path.join(root, rel);
+      // Prefix each file path with the folder's real path relative to the
+      // workspace root ('' for the root repo). This keeps the combined diff
+      // unambiguous AND keeps paths resolvable on disk (e.g. meter-bsw/src/x.c
+      // → <root>/meter-bsw/src/x.c), so Deep Review's readFile/searchSymbol and
+      // the panel's "open file" both work.
+      const prefix = rel === '.' ? '' : rel;
+      const args = ['-C', dir, 'diff', 'HEAD', '--ignore-submodules=all'];
+      if (prefix) {
+        args.push(`--src-prefix=a/${prefix}/`, `--dst-prefix=b/${prefix}/`);
+      }
       try {
-        const { stdout } = await execFileAsync('git', [
-          '-C', dir, 'diff', 'HEAD', '--ignore-submodules=all',
-          `--src-prefix=a/${prefix}/`,
-          `--dst-prefix=b/${prefix}/`,
-        ], { cwd: dir, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        const { stdout } = await execFileAsync('git', args, {
+          cwd: dir, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+        });
         return (stdout ?? '').trim();
       } catch (error: any) {
+        const label = rel === '.' ? path.basename(root) : rel;
         const firstLine = String(error.message ?? error).split('\n')[0].trim();
-        throw new Error(`Git diff failed for "${prefix}": ${firstLine}`);
+        throw new Error(`Git diff failed for "${label}": ${firstLine}`);
       }
     })
   );
@@ -616,8 +625,9 @@ async function getCombinedFolderDiff(root: string, relPaths: string[]): Promise<
 
 /**
  * Run a combined review of the selected repos (panel-driven). Selections are
- * re-validated against the live repo list so only real repos reach git. Forced
- * to Quick + contextFromDiff because the repos aren't the open workspace tree.
+ * re-validated against the live repo list so only real repos reach git. Uses
+ * contextFromDiff (combined offline diff, folder-prefixed paths); honours the
+ * Quick/Deep toggle — the folders are checked out, so Deep's file tools resolve.
  */
 async function reviewSelectedFolders(relPaths: string[]) {
   if (!Array.isArray(relPaths) || relPaths.length === 0) { return; }
@@ -648,11 +658,14 @@ async function reviewSelectedFolders(relPaths: string[]) {
     return;
   }
 
+  // Display names for cross-component guidance in the prompt.
+  const components = selected.map(rel => rel === '.' ? path.basename(root) : rel);
+
   await runReviewWithProgress(
     profile,
     () => getCombinedFolderDiff(root, selected),
     await getSecrets(),
-    { contextFromDiff: true }
+    { contextFromDiff: true, components }
   );
 }
 
@@ -695,7 +708,7 @@ async function runReviewWithProgress(
   profile: ReviewProfile,
   getDiff: () => Promise<string> | string,
   keys: AIKeys = {},
-  opts: { contextFromDiff?: boolean } = {}
+  opts: { contextFromDiff?: boolean; components?: string[] } = {}
 ) {
   // Inject in-memory requirements if they belong to this profile.
   const profileWithReqs: ReviewProfile =
@@ -735,12 +748,11 @@ async function runReviewWithProgress(
 
       // Step 3: Send to AI — phase transition uses updateLoading (full HTML rebuild),
       // then all high-frequency token updates use patchLoading (postMessage only).
-      // Off-tree diffs (multi-branch combined review) force Quick: Deep Review's
-      // file-reading tools operate on the checked-out branch, which wouldn't
-      // match the reviewed branches' diffs.
+      // contextFromDiff = multi-folder review. The folders ARE checked out in the
+      // workspace and their paths are real workspace-relative paths, so Deep's
+      // file tools resolve correctly — honour the Quick/Deep toggle either way.
       const forceDiffContext = !!opts.contextFromDiff;
-      const isDeep = !forceDiffContext
-        && extensionContext.workspaceState.get<string>('revvy.reviewScope', 'quick') === 'deep';
+      const isDeep = extensionContext.workspaceState.get<string>('revvy.reviewScope', 'quick') === 'deep';
       progress.report({ message: isDeep ? 'Starting Deep Review…' : 'Analyzing with AI…' });
       panelProvider.updateLoading(isDeep ? 'Starting Deep Review…' : 'Analyzing changes…', 0.5);
 
@@ -756,25 +768,26 @@ async function runReviewWithProgress(
         // For Deep Review, track the current activity label separately so
         // tool-call notifications can update it immediately without waiting
         // for the 40-char throttle that drives normal token-counter updates.
-        let deepLabel = isDeep ? 'Exploring workspace…' : '';
+        let deepLabel = isDeep ? 'Exploring the codebase…' : '';
 
         const onChunk = (chunk: string) => {
           tokenCount += chunk.length;
 
           if (isDeep) {
-            // Detect "[Turn X/Y, tool Z/W: toolName]" emitted by deepReviewer on each tool call.
-            // Fire an immediate patchLoading so the user sees the active tool name right away.
-            const m = chunk.match(/\[Turn (\d+)\/\d+, tool (\d+)\/(\d+): ([^\]]+)\]/);
+            // Human-readable activity emitted by deepReviewer ("[ACT] Reading foo.c…").
+            // Show it immediately so the loading screen reflects what's happening.
+            const m = chunk.match(/\[ACT\]\s*(.+)/);
             if (m) {
-              deepLabel = `Exploring: ${m[4]} (tool ${m[2]}/${m[3]})`;
+              deepLabel = m[1].trim();
               progress.report({ message: deepLabel });
               panelProvider.patchLoading(deepLabel, Math.round(tokenCount / 4), filesTotal, filesDone);
               lastReportedToken = tokenCount;
               return; // skip the normal throttle path for this chunk
             }
-            // Context-cap and budget-exhaustion finalise signals
-            if (chunk.includes('Context limit reached') || chunk.includes('Tool budget reached')) {
-              deepLabel = 'Finalizing review…';
+            // Once the model streams prose (no more tool markers), it's writing
+            // the final review.
+            if (chunk.trim().length > 0) {
+              deepLabel = 'Writing the review…';
             }
           }
 
@@ -782,13 +795,13 @@ async function runReviewWithProgress(
             lastReportedToken = tokenCount;
             const approxTokens = Math.round(tokenCount / 4);
             const label = isDeep ? deepLabel : 'Generating report…';
-            progress.report({ message: `${label} (~${approxTokens} tokens)` });
+            progress.report({ message: label });
             panelProvider.patchLoading(label, approxTokens, filesTotal, filesDone);
           }
         };
 
         const result = isDeep
-          ? await runDeepReview(diff, profileWithReqs, keys, onChunk)
+          ? await runDeepReview(diff, profileWithReqs, keys, onChunk, undefined, undefined, opts.components)
           : await runReview(
               diff, profileWithReqs, undefined, keys, onChunk,
               // Resolve commit-style rules once per review — never for remote reviews
@@ -800,7 +813,8 @@ async function runReviewWithProgress(
               forceDiffContext
                 ? 'all_in_one'
                 : extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file'),
-              forceDiffContext
+              forceDiffContext,
+              opts.components
             );
 
         // Impact analysis — engine-agnostic extra pass driven by the team's
@@ -883,7 +897,20 @@ async function selectProfile() {
     // Refresh home panel so the profile name and requirements badge stay current.
     const label = activeRequirements ? buildRequirementsLabel(activeRequirements.text) : '';
     panelProvider.showWelcome(!!activeRequirements, label);
+    // The welcome HTML is identical across profiles (name is JS-filled), so push
+    // the new badge directly — re-assigning identical HTML won't re-fetch it.
+    await refreshProfileBadge();
   }
+}
+
+/** Compute the current profile badge and push it to the home panel. */
+async function refreshProfileBadge(): Promise<void> {
+  try {
+    const badge = await vscode.commands.executeCommand<{
+      label?: string; version?: string; syncedFrom?: string; repoLinked?: boolean;
+    }>('revvy.getProfileBadge');
+    panelProvider.refreshProfileBadge(badge ?? {});
+  } catch { /* ignore — panel keeps its current badge */ }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1528,23 +1555,23 @@ async function reviewMultiMR() {
         let lastReportedToken = 0;
         const repoCount = sources.length;
 
-        let deepLabel = isDeep ? 'Exploring repository…' : '';
+        let deepLabel = isDeep ? 'Exploring the repositories…' : '';
 
         const onChunk = (chunk: string) => {
           tokenCount += chunk.length;
 
           if (isDeep) {
-            // Detect "[Turn X/Y, tool Z/W: toolName]" emitted by deepReviewer on each tool call.
-            const m = chunk.match(/\[Turn (\d+)\/\d+, tool (\d+)\/(\d+): ([^\]]+)\]/);
+            // Human-readable activity emitted by deepReviewer ("[ACT] Reading foo.c…").
+            const m = chunk.match(/\[ACT\]\s*(.+)/);
             if (m) {
-              deepLabel = `Exploring: ${m[4]} (tool ${m[2]}/${m[3]})`;
+              deepLabel = m[1].trim();
               progress.report({ message: deepLabel });
               panelProvider.patchLoading(deepLabel, Math.round(tokenCount / 4), repoCount, 0);
               lastReportedToken = tokenCount;
               return;
             }
-            if (chunk.includes('Context limit reached') || chunk.includes('Tool budget reached')) {
-              deepLabel = 'Finalizing review…';
+            if (chunk.trim().length > 0) {
+              deepLabel = 'Writing the review…';
             }
           }
 
@@ -1552,7 +1579,7 @@ async function reviewMultiMR() {
             lastReportedToken = tokenCount;
             const approxTokens = Math.round(tokenCount / 4);
             const label = isDeep ? deepLabel : 'Generating report…';
-            progress.report({ message: `${label} (~${approxTokens} tokens)` });
+            progress.report({ message: label });
             panelProvider.patchLoading(label, approxTokens, repoCount, 0);
           }
         };

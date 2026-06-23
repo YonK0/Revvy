@@ -130,7 +130,10 @@ const DEEP_REVIEW_TOOLS: vscode.LanguageModelChatTool[] = [
     name: 'searchSymbol',
     description:
       'Search workspace files for occurrences of a symbol or text pattern. ' +
-      'Use this to find callers, usages, and cross-file references to changed APIs.',
+      'Use this to find callers, usages, and cross-file references to changed APIs. ' +
+      'PERFORMANCE: always pass fileGlob to scope the search to the relevant area/' +
+      'file type (e.g. "layers/**", "**/*.c") — an unscoped search of a large repo ' +
+      'is slow. Prefer one scoped search over several unscoped ones.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -140,7 +143,7 @@ const DEEP_REVIEW_TOOLS: vscode.LanguageModelChatTool[] = [
         },
         fileGlob: {
           type: 'string',
-          description: 'Optional glob to restrict search (e.g. "**/*.c", "**/*.ts")',
+          description: 'Glob to restrict the search — strongly recommended for speed (e.g. "layers/**", "**/*.c", "**/*.ts")',
         },
       },
       required: ['pattern'],
@@ -670,27 +673,45 @@ export async function executeTool(
         }
 
         // ── Local path: search workspace files ────────────────────────────
+        // Perf: an unscoped search of a large monorepo (Yocto layers, vendored
+        // kernel trees, big .patch files) can take a minute+. We (a) exclude
+        // heavy build/output/cache dirs, (b) skip binary/huge file types,
+        // (c) read in parallel batches, and (d) stop early once we have enough
+        // matches — so wall-time stays a few seconds even unscoped.
         const fileGlob = typeof input.fileGlob === 'string' ? input.fileGlob : '**/*';
         const files = await vscode.workspace.findFiles(
           fileGlob,
-          '{**/node_modules/**,**/out/**,**/dist/**,**/build/**}',
-          1000
+          '{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/build/**,**/tmp/**,**/tmp-glibc/**,**/sstate-cache/**,**/downloads/**,**/.cache/**,**/deploy/**}',
+          2000,
         );
+        // Skip extensions that are binary or pathologically large (e.g. kernel
+        // patches), which dominate read time and rarely hold useful matches.
+        const SKIP_EXT = /\.(patch|diff|bin|img|hex|elf|o|a|so|ko|tar|gz|bz2|xz|zip|7z|png|jpe?g|gif|ico|pdf|svg|lock|map)$/i;
+        const candidates = files.filter(f => !SKIP_EXT.test(f.path));
         const results: string[] = [];
-        for (const fileUri of files) {
-          if (results.length >= 200) { break; }
-          try {
-            const bytes = await vscode.workspace.fs.readFile(fileUri);
-            const content = new TextDecoder().decode(bytes);
-            if (!content.includes(pattern)) { continue; }
-            const lines = content.split('\n');
-            const relPath = vscode.workspace.asRelativePath(fileUri);
-            for (let i = 0; i < lines.length && results.length < 200; i++) {
-              if (lines[i].includes(pattern)) {
-                results.push(`${relPath}:${i + 1}: ${lines[i].trim()}`);
+        const MAX_RESULTS = 200;
+        const MAX_FILE_BYTES = 512 * 1024; // skip very large files
+        const BATCH = 40;
+        for (let i = 0; i < candidates.length && results.length < MAX_RESULTS; i += BATCH) {
+          const batch = candidates.slice(i, i + BATCH);
+          const reads = await Promise.all(batch.map(async (uri) => {
+            try {
+              const bytes = await vscode.workspace.fs.readFile(uri);
+              if (bytes.byteLength > MAX_FILE_BYTES) { return null; }
+              return { uri, content: new TextDecoder().decode(bytes) };
+            } catch { return null; }
+          }));
+          for (const r of reads) {
+            if (!r || results.length >= MAX_RESULTS) { continue; }
+            if (!r.content.includes(pattern)) { continue; }
+            const lines = r.content.split('\n');
+            const relPath = vscode.workspace.asRelativePath(r.uri);
+            for (let j = 0; j < lines.length && results.length < MAX_RESULTS; j++) {
+              if (lines[j].includes(pattern)) {
+                results.push(`${relPath}:${j + 1}: ${lines[j].trim()}`);
               }
             }
-          } catch { /* skip unreadable files */ }
+          }
         }
         if (results.length === 0) { return `(no matches found for "${pattern}")`; }
         return trimToolResult(results.join('\n'));
@@ -732,8 +753,16 @@ function buildDeepUserPrompt(
   diff: string,
   symbolList: string[],
   profile: ReviewProfile,
+  components?: string[],
 ): string {
   const enabledRules = profile.rules.filter(r => r.enabled);
+  // Cross-component guidance for a combined multi-folder review.
+  const componentBlock = (components && components.length > 1)
+    ? `## Multi-Component Review (${components.length} components: ${components.join(', ')})\n` +
+      `File paths are prefixed with their component folder. Use readFile/searchSymbol to reason ACROSS components: ` +
+      `trace changed shared symbols/APIs into their callers in the OTHER components, and flag contract/signature/protocol ` +
+      `mismatches, missing matching changes, and version/build coupling between components. Name both components in such findings.\n\n`
+    : '';
   const ruleLines = enabledRules.map(r => {
     const desc = r.description.length > 80 ? r.description.slice(0, 80) + '…' : r.description;
     const sug = r.suggestion ? ` → ${r.suggestion}` : '';
@@ -785,6 +814,7 @@ function buildDeepUserPrompt(
     `You are a professional code reviewer specializing in ${profile.label}.\n` +
     `${profile.system_prompt_extra ? profile.system_prompt_extra.trim() + '\n\n' : ''}` +
     ticketSection +
+    componentBlock +
     `## Review Rules (${enabledRules.length} enabled)\n` +
     `ID | Severity | Title | Description\n` +
     `---|----------|-------|------------\n` +
@@ -1136,6 +1166,25 @@ async function forceFinalize(
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Human-readable description of what a tool call is doing, for the loading
+ * screen (e.g. "Reading map-client_1.0.bb…") — instead of "tool 30/100".
+ */
+function describeToolActivity(name: string, input: Record<string, unknown>): string {
+  const base = (p: unknown) => {
+    const s = typeof p === 'string' ? p : '';
+    return s.split('/').pop() || s;
+  };
+  switch (name) {
+    case 'listChangedFiles':   return 'Scanning changed files…';
+    case 'readFile':           return `Reading ${base(input.path) || 'a file'}…`;
+    case 'getFileDiff':        return `Inspecting changes in ${base(input.filePath) || 'a file'}…`;
+    case 'searchSymbol':       return `Searching for "${typeof input.pattern === 'string' ? input.pattern : ''}"…`;
+    case 'listWorkspaceFiles': return 'Exploring project files…';
+    default:                   return 'Analyzing the code…';
+  }
+}
+
 export async function runDeepReview(
   diff: string,
   profile: ReviewProfile,
@@ -1143,6 +1192,7 @@ export async function runDeepReview(
   onChunk?: StreamChunkCallback,
   sources?: ReviewSource[],
   remoteReader?: RemoteFileReader,
+  components?: string[],   // component folder names for cross-component guidance
 ): Promise<ReviewResult> {
   if (!diff.trim()) { throw new Error('No diff to review'); }
 
@@ -1200,7 +1250,7 @@ export async function runDeepReview(
   // ── Build initial context ─────────────────────────────────────────────────
   const symbolList = extractChangedSymbols(diff);
   const { tier1, tier2 } = extractHighPrioritySymbols(diff);
-  const initialPrompt = buildDeepUserPrompt(diff, symbolList, profile);
+  const initialPrompt = buildDeepUserPrompt(diff, symbolList, profile, components);
   log(`SYMBOLS  ${symbolList.length > 0 ? symbolList.join(', ') : '(none detected)'}`);
   log(`PRIORITY SYMBOLS  tier1=[${tier1.join(', ')}]  tier2=[${tier2.join(', ')}]`);;
 
@@ -1225,7 +1275,7 @@ export async function runDeepReview(
       new vscode.LanguageModelToolResultPart(groundingCallId, [new vscode.LanguageModelTextPart(groundingResult)]),
     ]));
     toolCallCount = 1;
-    onChunk?.(`\n[Turn 0/${MAX_AGENT_ROUNDS}, tool 1/${MAX_TOOL_CALLS}: listChangedFiles]\n`);
+    onChunk?.(`\n[ACT] ${describeToolActivity('listChangedFiles', {})}\n`);
     log(`GROUNDING  listChangedFiles →`);
     log(`  ${groundingResult.replace(/\n/g, '\n  ')}`);
     console.log(`[Revvy] Deep Review: grounding listChangedFiles complete — ${groundingResult.split('\n').length} files`);
@@ -1255,7 +1305,7 @@ export async function runDeepReview(
       toolCallCount++;
       const preview = trimmed.split('\n')[0].slice(0, 120);
       groundedSymbols.push({ sym, preview });
-      onChunk?.(`\n[Turn 0/${MAX_AGENT_ROUNDS}, tool ${toolCallCount}/${MAX_TOOL_CALLS}: searchSymbol(${sym})]\n`);
+      onChunk?.(`\n[ACT] ${describeToolActivity('searchSymbol', { pattern: sym })}\n`);
       log(`GROUNDING  searchSymbol(${sym}) → ${preview}`);
     }
     console.log(`[Revvy] Deep Review: grounding resolved ${groundedSymbols.length} priority symbols`);
@@ -1302,7 +1352,7 @@ export async function runDeepReview(
       toolCallCount++;
       const preview = trimmed.split('\n')[0].slice(0, 120);
       reqGroundedSymbols.push({ sym, preview });
-      onChunk?.(`\n[Turn 0/${MAX_AGENT_ROUNDS}, tool ${toolCallCount}/${MAX_TOOL_CALLS}: searchSymbol(${sym}) [requirement]]\n`);
+      onChunk?.(`\n[ACT] ${describeToolActivity('searchSymbol', { pattern: sym })}\n`);
       log(`GROUNDING [req]  searchSymbol(${sym}) → ${preview}`);
     }
     if (reqGroundedSymbols.length > 0) {
@@ -1471,7 +1521,7 @@ export async function runDeepReview(
         toolCache.set(cacheKey, result);
         toolCallCount++;
         logResult(`result (${result.length} chars)`, result);
-        onChunk?.(`\n[Turn ${round + 1}/${MAX_AGENT_ROUNDS}, tool ${toolCallCount}/${MAX_TOOL_CALLS}: ${call.name}]\n`);
+        onChunk?.(`\n[ACT] ${describeToolActivity(call.name, (call.input ?? {}) as Record<string, unknown>)}\n`);
         console.log(`[Revvy] Deep Review: round=${round + 1}, tool=${call.name}, calls=${toolCallCount}`);
       }
 
